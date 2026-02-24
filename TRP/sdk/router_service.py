@@ -28,6 +28,7 @@ class RouterService:
         call_record_ttl_sec: int = 86400,
         async_result_ttl_sec: int = 600,
         async_execution_lease_sec: int = 30,
+        async_execution_heartbeat_sec: Optional[float] = None,
         async_event_limit: int = 256,
         async_cleanup_interval_sec: int = 30,
         worker_id: Optional[str] = None,
@@ -52,6 +53,14 @@ class RouterService:
         self._async_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="trp-async")
         self._async_result_ttl_ms = max(1000, int(async_result_ttl_sec * 1000))
         self._async_execution_lease_ms = max(1000, int(async_execution_lease_sec * 1000))
+        if async_execution_heartbeat_sec is None:
+            heartbeat_ms = max(250, min(self._async_execution_lease_ms // 3, 5000))
+        else:
+            heartbeat_ms = max(250, int(float(async_execution_heartbeat_sec) * 1000))
+        self._async_execution_heartbeat_ms = min(
+            heartbeat_ms,
+            max(250, self._async_execution_lease_ms // 2),
+        )
         self._async_event_limit = max(1, int(async_event_limit))
         self._async_cleanup_interval_ms = max(1000, int(async_cleanup_interval_sec * 1000))
         self._async_last_cleanup_ms = 0
@@ -845,6 +854,63 @@ class RouterService:
             cloned["payload"] = dict(frame["payload"])
         return cloned
 
+    def _start_async_lease_heartbeat(self, session_id: str, call_id: str) -> tuple[Optional[threading.Event], Optional[threading.Thread]]:
+        if self.runtime_state is None:
+            return None, None
+
+        stop_event = threading.Event()
+
+        def _loop() -> None:
+            interval_sec = max(0.05, self._async_execution_heartbeat_ms / 1000.0)
+            lease_ttl_sec = max(1, self._async_execution_lease_ms // 1000)
+            state_ttl_sec = max(1, self._async_result_ttl_ms // 1000)
+            while not stop_event.wait(interval_sec):
+                try:
+                    renew = self.runtime_state.renew_async_execution_lease(
+                        session_id,
+                        call_id,
+                        worker_id=self._worker_id,
+                        lease_ttl_sec=lease_ttl_sec,
+                        state_ttl_sec=state_ttl_sec,
+                    )
+                except Exception as e:
+                    self.audit.log_event(
+                        "call.async_lease_renew_error",
+                        {
+                            "session_id": session_id,
+                            "call_id": call_id,
+                            "worker_id": self._worker_id,
+                            "error": repr(e),
+                        },
+                    )
+                    continue
+                if not bool(renew.get("renewed")):
+                    self.audit.log_event(
+                        "call.async_lease_lost",
+                        {
+                            "session_id": session_id,
+                            "call_id": call_id,
+                            "worker_id": self._worker_id,
+                            "reason": renew.get("reason"),
+                        },
+                    )
+                    return
+
+        t = threading.Thread(
+            target=_loop,
+            name=f"trp-lease-{self._worker_id[:8]}",
+            daemon=True,
+        )
+        t.start()
+        return stop_event, t
+
+    @staticmethod
+    def _stop_async_lease_heartbeat(stop_event: Optional[threading.Event], thread: Optional[threading.Thread]) -> None:
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
     def _run_async_call(self, frame: Dict[str, Any]) -> None:
         session_id = frame.get("session_id")
         payload = frame.get("payload", {}) if isinstance(frame.get("payload"), dict) else {}
@@ -852,6 +918,8 @@ class RouterService:
         if not isinstance(session_id, str) or not isinstance(call_id, str):
             return
 
+        lease_hb_stop: Optional[threading.Event] = None
+        lease_hb_thread: Optional[threading.Thread] = None
         if self.runtime_state is not None:
             claim = self.runtime_state.claim_async_execution(
                 session_id,
@@ -862,6 +930,7 @@ class RouterService:
             )
             if not bool(claim.get("claimed")):
                 return
+            lease_hb_stop, lease_hb_thread = self._start_async_lease_heartbeat(session_id, call_id)
         else:
             self._set_async_call_state(
                 session_id,
@@ -884,85 +953,88 @@ class RouterService:
         )
 
         try:
-            res = self._execute_call_core(frame, check_seq=False)
-        except Exception as e:
-            self.audit.log_event("call.async_failed", {
-                "session_id": session_id,
-                "call_id": call_id,
-                "error": repr(e),
-            })
-            res = self._nack(frame, call_id, "INTERNAL_ERROR", "TRP_5001", "internal error", False)
+            try:
+                res = self._execute_call_core(frame, check_seq=False)
+            except Exception as e:
+                self.audit.log_event("call.async_failed", {
+                    "session_id": session_id,
+                    "call_id": call_id,
+                    "error": repr(e),
+                })
+                res = self._nack(frame, call_id, "INTERNAL_ERROR", "TRP_5001", "internal error", False)
 
-        if res["frame_type"] == "RESULT":
-            self._publish_async_success_partials(session_id, call_id, res["payload"])
-            self._set_async_call_state(
-                session_id,
-                call_id,
-                {
-                    "status": "SUCCESS",
-                    "result_frame_type": "RESULT",
-                    "result_payload": res["payload"],
-                    "execution_owner": None,
-                    "execution_lease_expires_at": None,
-                    "updated_at": int(time.time() * 1000),
-                },
-            )
-            self._append_async_event(
-                session_id,
-                call_id,
-                {
-                    "kind": "STATE",
-                    "stage": "COMPLETED",
-                    "message": "async execution completed",
-                },
-            )
-            return
-
-        if res["frame_type"] == "NACK":
-            self._append_async_event(
-                session_id,
-                call_id,
-                {
-                    "kind": "ERROR",
-                    "error": {
-                        "error_class": res["payload"].get("error_class"),
-                        "error_code": res["payload"].get("error_code"),
-                        "message": res["payload"].get("message"),
-                        "retryable": res["payload"].get("retryable"),
+            if res["frame_type"] == "RESULT":
+                self._publish_async_success_partials(session_id, call_id, res["payload"])
+                self._set_async_call_state(
+                    session_id,
+                    call_id,
+                    {
+                        "status": "SUCCESS",
+                        "result_frame_type": "RESULT",
+                        "result_payload": res["payload"],
+                        "execution_owner": None,
+                        "execution_lease_expires_at": None,
+                        "updated_at": int(time.time() * 1000),
                     },
-                },
-            )
+                )
+                self._append_async_event(
+                    session_id,
+                    call_id,
+                    {
+                        "kind": "STATE",
+                        "stage": "COMPLETED",
+                        "message": "async execution completed",
+                    },
+                )
+                return
+
+            if res["frame_type"] == "NACK":
+                self._append_async_event(
+                    session_id,
+                    call_id,
+                    {
+                        "kind": "ERROR",
+                        "error": {
+                            "error_class": res["payload"].get("error_class"),
+                            "error_code": res["payload"].get("error_code"),
+                            "message": res["payload"].get("message"),
+                            "retryable": res["payload"].get("retryable"),
+                        },
+                    },
+                )
+                self._set_async_call_state(
+                    session_id,
+                    call_id,
+                    {
+                        "status": "FAILED",
+                        "result_frame_type": "NACK",
+                        "result_payload": res["payload"],
+                        "execution_owner": None,
+                        "execution_lease_expires_at": None,
+                        "updated_at": int(time.time() * 1000),
+                    },
+                )
+                return
+
             self._set_async_call_state(
                 session_id,
                 call_id,
                 {
                     "status": "FAILED",
-                    "result_frame_type": "NACK",
-                    "result_payload": res["payload"],
+                    "result_frame_type": str(res.get("frame_type")),
+                    "result_payload": {
+                        "error_class": "INTERNAL_ERROR",
+                        "error_code": "TRP_5003",
+                        "message": f"unexpected async result frame_type: {res.get('frame_type')}",
+                        "retryable": False,
+                    },
                     "execution_owner": None,
                     "execution_lease_expires_at": None,
                     "updated_at": int(time.time() * 1000),
                 },
             )
-            return
-
-        self._set_async_call_state(
-            session_id,
-            call_id,
-            {
-                "status": "FAILED",
-                "result_frame_type": str(res.get("frame_type")),
-                "result_payload": {
-                    "error_class": "INTERNAL_ERROR",
-                    "error_code": "TRP_5003",
-                    "message": f"unexpected async result frame_type: {res.get('frame_type')}",
-                    "retryable": False,
-                },
-                "execution_owner": None,
-                "execution_lease_expires_at": None,
-                "updated_at": int(time.time() * 1000),
-            },
-        )
+        finally:
+            self._stop_async_lease_heartbeat(lease_hb_stop, lease_hb_thread)
 
     @staticmethod
     def _is_stale_async_lease(state: Dict[str, Any]) -> bool:

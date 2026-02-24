@@ -17,6 +17,7 @@ from sdk.in_memory_impl import (
     InMemoryIdempotencyStore,
     InMemorySessionManager,
 )
+from sdk.observability import TRPMetrics
 from sdk.redis_impl import (
     RedisIdempotencyStore,
     RedisRESPClient,
@@ -46,6 +47,20 @@ class CountingSearchExecutor(BasicExecutor):
             # widen race window to exercise cross-instance claim
             time.sleep(0.05)
         return super().execute(cap, native_args, timeout_ms)
+
+
+class SlowCountingSearchExecutor(CountingSearchExecutor):
+    def __init__(self, *, sleep_sec: float) -> None:
+        super().__init__()
+        self._sleep_sec = float(sleep_sec)
+
+    def execute(self, cap, native_args, timeout_ms):  # type: ignore[override]
+        if cap.cap_id == "cap.search.web.v1":
+            with self._lock:
+                self.execute_count += 1
+            time.sleep(self._sleep_sec)
+            return BasicExecutor.execute(self, cap, native_args, timeout_ms)
+        return BasicExecutor.execute(self, cap, native_args, timeout_ms)
 
 
 @dataclass
@@ -104,6 +119,8 @@ def _build_redis_service(
     approval_secret: Optional[str] = None,
     executor: Optional[Any] = None,
     worker_id: Optional[str] = None,
+    async_execution_lease_sec: int = 30,
+    async_execution_heartbeat_sec: Optional[float] = None,
 ) -> RouterService:
     redis = RedisRESPClient("redis://127.0.0.1:6379/0")
     registry = InMemoryCapabilityRegistry()
@@ -125,6 +142,8 @@ def _build_redis_service(
         shaper=BasicResultShaper(),
         audit=NullAuditLogger(),
         runtime_state=RedisRuntimeStateStore(redis=redis, key_prefix=prefix),
+        async_execution_lease_sec=async_execution_lease_sec,
+        async_execution_heartbeat_sec=async_execution_heartbeat_sec,
         worker_id=worker_id,
     )
 
@@ -375,6 +394,25 @@ def test_signed_approval_tokens_high_and_critical() -> None:
         )
     )
     assert res_crit_ok["frame_type"] == "RESULT", res_crit_ok
+
+
+def test_metrics_collector_renders_prometheus_text() -> None:
+    m = TRPMetrics(backend="memory")
+    m.set_readiness(ready=True)
+    m.observe_http(path="/trp/frame", status_code=200, latency_ms=12.5)
+    m.observe_frame(
+        request_frame_type="CALL_REQ",
+        response_frame_type="NACK",
+        latency_ms=8.0,
+        error_class="SCHEMA_MISMATCH",
+        error_code="TRP_2000",
+    )
+    out = m.render_prometheus()
+    assert "trp_router_info" in out
+    assert 'trp_router_ready ' in out
+    assert 'trp_http_requests_total{path="/trp/frame",status_code="200"}' in out
+    assert 'trp_frames_total{request_frame_type="CALL_REQ",response_frame_type="NACK"}' in out
+    assert 'trp_nacks_total{error_class="SCHEMA_MISMATCH",error_code="TRP_2000"}' in out
 
 
 @pytest.mark.integration
@@ -645,5 +683,84 @@ def test_redis_async_execution_claim_prevents_duplicate_worker_execution() -> No
             payload={"call_id": call_id},
         )
     )
+    assert q["frame_type"] == "RESULT_QUERY_RES", q
+    assert q["payload"]["status"] == "SUCCESS", q
+
+
+@pytest.mark.integration
+def test_redis_async_execution_lease_renew_prevents_steal_after_lease_window() -> None:
+    if not _redis_available():
+        pytest.skip("Redis not available on 127.0.0.1:6379")
+
+    prefix = f"trp_lease_renew_{uuid.uuid4().hex[:8]}"
+    shared_executor = SlowCountingSearchExecutor(sleep_sec=2.4)
+    service_a = _build_redis_service(
+        prefix=prefix,
+        executor=shared_executor,
+        worker_id="worker_a",
+        async_execution_lease_sec=1,
+        async_execution_heartbeat_sec=0.2,
+    )
+    service_b = _build_redis_service(
+        prefix=prefix,
+        executor=shared_executor,
+        worker_id="worker_b",
+        async_execution_lease_sec=1,
+        async_execution_heartbeat_sec=0.2,
+    )
+
+    _, ctx = _hello_and_sync(service_a, agent_id="pytest_lease_renew")
+    call_id = "call_lease_renew"
+
+    service_a._set_async_call_state(  # type: ignore[attr-defined]
+        ctx.session_id,
+        call_id,
+        {
+            "status": "QUEUED",
+            "result_frame_type": None,
+            "result_payload": None,
+            "events": [],
+            "next_event_id": 1,
+            "updated_at": int(time.time() * 1000),
+        },
+    )
+    service_a._append_async_event(  # type: ignore[attr-defined]
+        ctx.session_id,
+        call_id,
+        {"kind": "STATE", "stage": "QUEUED", "message": "seeded for lease renew test"},
+    )
+
+    frame = {
+        "trp_version": "0.1",
+        "frame_type": "CALL_REQ",
+        "session_id": ctx.session_id,
+        "frame_id": f"frm_async_seed_{uuid.uuid4().hex[:8]}",
+        "trace_id": ctx.trace_id,
+        "timestamp_ms": int(time.time() * 1000),
+        "catalog_epoch": ctx.catalog_epoch,
+        "seq": ctx.seq,
+        "payload": {
+            "call_id": call_id,
+            "idempotency_key": None,
+            "idx": 0,
+            "cap_id": "cap.search.web.v1",
+            "depends_on": [],
+            "attempt": 1,
+            "timeout_ms": 8000,
+            "approval_token": None,
+            "execution_mode": "ASYNC",
+            "args": {"query": "lease renew", "top_k": 5},
+        },
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_a = pool.submit(service_a._run_async_call, dict(frame))  # type: ignore[attr-defined]
+        time.sleep(1.35)  # > initial 1s lease window; heartbeat should have renewed
+        fut_b = pool.submit(service_b._run_async_call, dict(frame))  # type: ignore[attr-defined]
+        fut_b.result()
+        fut_a.result()
+
+    assert shared_executor.execute_count == 1, shared_executor.execute_count
+    q = service_a.handle_frame(ctx.next_frame(frame_type="RESULT_QUERY_REQ", payload={"call_id": call_id}))
     assert q["frame_type"] == "RESULT_QUERY_RES", q
     assert q["payload"]["status"] == "SUCCESS", q

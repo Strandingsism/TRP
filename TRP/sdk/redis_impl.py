@@ -342,8 +342,8 @@ class RedisRuntimeStateStore(RuntimeStateStore):
     - async_state: 结果查询/partial 事件状态
 
     说明：
-    - 当前为简单 JSON GET/SET，适合单 Router 实例 + 多线程。
-    - 若后续扩展到多实例，需要改成 Lua/事务以保证跨进程并发一致性。
+    - 基础读写仍为 JSON GET/SET。
+    - async_state 的关键并发路径（merge/append/claim/renew）已使用 Lua 原子脚本。
     """
 
     def __init__(self, *, redis: RedisRESPClient, key_prefix: str = "trp"):
@@ -453,6 +453,42 @@ redis.call('SET', key, cjson.encode(rec), 'PX', state_ttl_ms)
 return cjson.encode({claimed=true, reason='OK', state=rec})
 """
 
+    _RENEW_ASYNC_EXECUTION_LEASE_LUA = """
+local key = KEYS[1]
+local worker_id = ARGV[1]
+local lease_ms = tonumber(ARGV[2])
+local state_ttl_ms = tonumber(ARGV[3])
+local now_ms = tonumber(ARGV[4])
+
+local raw = redis.call('GET', key)
+if not raw then
+  return cjson.encode({renewed=false, reason='NOT_FOUND'})
+end
+
+local rec = cjson.decode(raw)
+local status = tostring(rec['status'] or '')
+if status ~= 'RUNNING' then
+  return cjson.encode({renewed=false, reason='NOT_RUNNING', state=rec})
+end
+
+local current_owner = tostring(rec['execution_owner'] or '')
+if current_owner ~= tostring(worker_id) then
+  return cjson.encode({renewed=false, reason='OWNER_MISMATCH', state=rec})
+end
+
+rec['execution_owner'] = worker_id
+rec['execution_lease_expires_at'] = now_ms + lease_ms
+rec['updated_at'] = now_ms
+if rec['expires_at'] == nil or tonumber(rec['expires_at']) < (now_ms + state_ttl_ms) then
+  rec['expires_at'] = now_ms + state_ttl_ms
+end
+if rec['events'] == nil then rec['events'] = {} end
+if rec['next_event_id'] == nil then rec['next_event_id'] = 1 end
+
+redis.call('SET', key, cjson.encode(rec), 'PX', state_ttl_ms)
+return cjson.encode({renewed=true, reason='OK', state=rec})
+"""
+
     def get_call_record(self, session_id: str, call_id: str) -> Optional[Dict[str, Any]]:
         raw = self._redis.execute("GET", self._call_record_key(session_id, call_id))
         return self._loads_obj(raw)
@@ -529,6 +565,30 @@ return cjson.encode({claimed=true, reason='OK', state=rec})
             now_ms,
         )
         return self._loads_obj(raw) or {"claimed": False, "reason": "INVALID_RESPONSE", "state": None}
+
+    def renew_async_execution_lease(
+        self,
+        session_id: str,
+        call_id: str,
+        *,
+        worker_id: str,
+        lease_ttl_sec: int,
+        state_ttl_sec: int,
+    ) -> Dict[str, Any]:
+        lease_ms = max(1000, int(lease_ttl_sec * 1000))
+        state_ttl_ms = max(1000, int(state_ttl_sec * 1000))
+        now_ms = int(time.time() * 1000)
+        raw = self._redis.execute(
+            "EVAL",
+            self._RENEW_ASYNC_EXECUTION_LEASE_LUA,
+            1,
+            self._async_state_key(session_id, call_id),
+            worker_id,
+            lease_ms,
+            state_ttl_ms,
+            now_ms,
+        )
+        return self._loads_obj(raw) or {"renewed": False, "reason": "INVALID_RESPONSE", "state": None}
 
     def _set_json(self, key: str, obj: Dict[str, Any], ttl_sec: int) -> None:
         ttl_ms = max(1000, int(ttl_sec * 1000))

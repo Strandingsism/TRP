@@ -5,6 +5,7 @@ import time
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from sdk.in_memory_impl import (
     InMemoryCapabilityRegistry,
@@ -25,6 +26,7 @@ from sdk.basic_adapter_executor import (
 )
 from sdk.basic_policy import BasicPolicyEngine
 from sdk.frame_validation import TRPFrameValidationError, validate_trp_frame
+from sdk.observability import TRPMetrics
 from sdk.router_service import RouterService
 
 app = FastAPI(title="TRP Router v0.1")
@@ -46,6 +48,17 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None or raw == "":
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float, *, min_value: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return max(min_value, v)
 
 
 def _schema_nack(raw_frame: Any, message: str, error_code: str = "TRP_2000") -> Dict[str, Any]:
@@ -77,6 +90,8 @@ audit = PrintAuditLogger()
 state_backend = str(os.getenv("TRP_STATE_BACKEND", "memory")).strip().lower()
 redis_url = os.getenv("TRP_REDIS_URL", "redis://127.0.0.1:6379/0")
 redis_prefix = str(os.getenv("TRP_REDIS_PREFIX", "trp")).strip() or "trp"
+redis_client = None
+metrics = TRPMetrics(backend=state_backend)
 
 if state_backend == "redis":
     redis_client = RedisRESPClient(redis_url, timeout_sec=float(os.getenv("TRP_REDIS_TIMEOUT_SEC", "2")))
@@ -118,6 +133,7 @@ router_service = RouterService(
     call_record_ttl_sec=_env_int("TRP_CALL_RECORD_TTL_SEC", 86400),
     async_result_ttl_sec=_env_int("TRP_ASYNC_RESULT_TTL_SEC", 600),
     async_execution_lease_sec=_env_int("TRP_ASYNC_EXECUTION_LEASE_SEC", 30),
+    async_execution_heartbeat_sec=_env_float("TRP_ASYNC_EXECUTION_HEARTBEAT_SEC", 0.0) or None,
     async_event_limit=_env_int("TRP_ASYNC_EVENT_LIMIT", 256),
     async_cleanup_interval_sec=_env_int("TRP_ASYNC_CLEANUP_INTERVAL_SEC", 30),
     worker_id=os.getenv("TRP_ROUTER_WORKER_ID") or None,
@@ -127,6 +143,11 @@ router_service = RouterService(
 @app.post("/trp/frame")
 async def trp_frame(request: Request) -> Dict[str, Any]:
     raw_frame: Any = None
+    t0 = time.time()
+    response_frame_type = "UNKNOWN"
+    err_cls = None
+    err_code = None
+    http_status_code = 200
     try:
         raw_frame = await request.json()
         if _env_bool("TRP_STRICT_VALIDATION", True):
@@ -135,13 +156,85 @@ async def trp_frame(request: Request) -> Dict[str, Any]:
             frame = raw_frame
         # 可选：从 header / session 注入 auth_context
         # frame["auth_context"] = {"role": "ops", "can_delete": True}
-        return router_service.handle_frame(frame)
+        res = router_service.handle_frame(frame)
+        response_frame_type = str(res.get("frame_type", "UNKNOWN"))
+        if response_frame_type == "NACK":
+            p = res.get("payload", {}) if isinstance(res.get("payload"), dict) else {}
+            err_cls = p.get("error_class")
+            err_code = p.get("error_code")
+        return res
     except TRPFrameValidationError as e:
-        return _schema_nack(raw_frame, str(e))
+        res = _schema_nack(raw_frame, str(e))
+        response_frame_type = "NACK"
+        err_cls = "SCHEMA_MISMATCH"
+        err_code = "TRP_2000"
+        return res
     except ValueError as e:
         # 包含 request.json() 的 JSON decode 错误
         if raw_frame is None:
-            return _schema_nack(None, f"invalid JSON body: {e}")
+            res = _schema_nack(None, f"invalid JSON body: {e}")
+            response_frame_type = "NACK"
+            err_cls = "SCHEMA_MISMATCH"
+            err_code = "TRP_2000"
+            return res
+        http_status_code = 500
         raise HTTPException(status_code=500, detail=f"router error: {e}")
     except Exception as e:
+        http_status_code = 500
         raise HTTPException(status_code=500, detail=f"router error: {e}")
+    finally:
+        latency_ms = (time.time() - t0) * 1000.0
+        request_frame_type = None
+        if isinstance(raw_frame, dict):
+            request_frame_type = raw_frame.get("frame_type")
+        if request_frame_type:
+            metrics.observe_frame(
+                request_frame_type=str(request_frame_type),
+                response_frame_type=str(response_frame_type),
+                latency_ms=latency_ms,
+                error_class=str(err_cls) if err_cls is not None else None,
+                error_code=str(err_code) if err_code is not None else None,
+            )
+        metrics.observe_http(path="/trp/frame", status_code=http_status_code, latency_ms=latency_ms)
+
+
+@app.get("/healthz")
+async def healthz() -> Dict[str, Any]:
+    metrics.observe_http(path="/healthz", status_code=200, latency_ms=0.0)
+    return {
+        "ok": True,
+        "backend": state_backend,
+        "timestamp_ms": int(time.time() * 1000),
+    }
+
+
+@app.get("/readyz")
+async def readyz() -> JSONResponse:
+    ready = True
+    detail: Dict[str, Any] = {"backend": state_backend}
+    if state_backend == "redis":
+        try:
+            ready = bool(redis_client and redis_client.ping())
+            detail["redis_ping"] = "PONG" if ready else "NO_PONG"
+        except Exception as e:
+            ready = False
+            detail["redis_error"] = str(e)
+    metrics.set_readiness(ready=ready)
+    code = 200 if ready else 503
+    metrics.observe_http(path="/readyz", status_code=code, latency_ms=0.0)
+    return JSONResponse(status_code=code, content={"ok": ready, **detail, "timestamp_ms": int(time.time() * 1000)})
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> PlainTextResponse:
+    # 每次导出前刷新 readiness gauge（尤其 Redis 模式）
+    if state_backend == "redis":
+        try:
+            metrics.set_readiness(ready=bool(redis_client and redis_client.ping()))
+        except Exception:
+            metrics.set_readiness(ready=False)
+    else:
+        metrics.set_readiness(ready=True)
+    body = metrics.render_prometheus()
+    metrics.observe_http(path="/metrics", status_code=200, latency_ms=0.0)
+    return PlainTextResponse(content=body, media_type="text/plain; version=0.0.4")

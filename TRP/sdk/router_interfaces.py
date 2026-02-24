@@ -135,6 +135,21 @@ class RuntimeStateStore(Protocol):
         """
         ...
 
+    def renew_async_execution_lease(
+        self,
+        session_id: str,
+        call_id: str,
+        *,
+        worker_id: str,
+        lease_ttl_sec: int,
+        state_ttl_sec: int,
+    ) -> Dict[str, Any]:
+        """
+        原子续租 async 执行权（仅当前 owner 可续租）。
+        返回 {"renewed": bool, "reason": "...", "state": {...}|None}
+        """
+        ...
+
 
 # ========= 参数语义映射 =========
 
