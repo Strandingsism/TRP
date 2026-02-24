@@ -413,6 +413,46 @@ redis.call('SET', key, cjson.encode(rec), 'PX', ttl_ms)
 return cjson.encode(rec)
 """
 
+    _CLAIM_ASYNC_EXECUTION_LUA = """
+local key = KEYS[1]
+local worker_id = ARGV[1]
+local lease_ms = tonumber(ARGV[2])
+local state_ttl_ms = tonumber(ARGV[3])
+local now_ms = tonumber(ARGV[4])
+
+local raw = redis.call('GET', key)
+if not raw then
+  return cjson.encode({claimed=false, reason='NOT_FOUND'})
+end
+
+local rec = cjson.decode(raw)
+local status = tostring(rec['status'] or '')
+
+if status == 'SUCCESS' or status == 'FAILED' then
+  return cjson.encode({claimed=false, reason='TERMINAL', state=rec})
+end
+
+local current_owner = rec['execution_owner']
+local current_lease_exp = tonumber(rec['execution_lease_expires_at'] or 0)
+
+if status == 'RUNNING' and current_owner ~= worker_id and current_lease_exp > now_ms then
+  return cjson.encode({claimed=false, reason='LEASE_HELD', state=rec})
+end
+
+rec['status'] = 'RUNNING'
+rec['execution_owner'] = worker_id
+rec['execution_lease_expires_at'] = now_ms + lease_ms
+rec['updated_at'] = now_ms
+if rec['expires_at'] == nil or tonumber(rec['expires_at']) < (now_ms + state_ttl_ms) then
+  rec['expires_at'] = now_ms + state_ttl_ms
+end
+if rec['events'] == nil then rec['events'] = {} end
+if rec['next_event_id'] == nil then rec['next_event_id'] = 1 end
+
+redis.call('SET', key, cjson.encode(rec), 'PX', state_ttl_ms)
+return cjson.encode({claimed=true, reason='OK', state=rec})
+"""
+
     def get_call_record(self, session_id: str, call_id: str) -> Optional[Dict[str, Any]]:
         raw = self._redis.execute("GET", self._call_record_key(session_id, call_id))
         return self._loads_obj(raw)
@@ -465,6 +505,30 @@ return cjson.encode(rec)
             ttl_window_ms,
         )
         return self._loads_obj(raw) or {}
+
+    def claim_async_execution(
+        self,
+        session_id: str,
+        call_id: str,
+        *,
+        worker_id: str,
+        lease_ttl_sec: int,
+        state_ttl_sec: int,
+    ) -> Dict[str, Any]:
+        lease_ms = max(1000, int(lease_ttl_sec * 1000))
+        state_ttl_ms = max(1000, int(state_ttl_sec * 1000))
+        now_ms = int(time.time() * 1000)
+        raw = self._redis.execute(
+            "EVAL",
+            self._CLAIM_ASYNC_EXECUTION_LUA,
+            1,
+            self._async_state_key(session_id, call_id),
+            worker_id,
+            lease_ms,
+            state_ttl_ms,
+            now_ms,
+        )
+        return self._loads_obj(raw) or {"claimed": False, "reason": "INVALID_RESPONSE", "state": None}
 
     def _set_json(self, key: str, obj: Dict[str, Any], ttl_sec: int) -> None:
         ttl_ms = max(1000, int(ttl_sec * 1000))

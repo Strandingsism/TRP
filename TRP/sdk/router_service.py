@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Any, Dict, List, Optional
 
@@ -26,8 +27,10 @@ class RouterService:
         runtime_state: Optional[RuntimeStateStore] = None,
         call_record_ttl_sec: int = 86400,
         async_result_ttl_sec: int = 600,
+        async_execution_lease_sec: int = 30,
         async_event_limit: int = 256,
         async_cleanup_interval_sec: int = 30,
+        worker_id: Optional[str] = None,
     ):
         self.sessions = sessions
         self.registry = registry
@@ -39,6 +42,7 @@ class RouterService:
         self.audit = audit
         self.runtime_state = runtime_state
         self._call_record_ttl_sec = max(1, int(call_record_ttl_sec))
+        self._worker_id = worker_id or f"router_{uuid.uuid4().hex[:8]}"
         self._call_records_lock = threading.Lock()
         # session_id -> call_id -> {"status": "SUCCESS"|"FAILED", "retryable": bool}
         self._call_records: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -47,6 +51,7 @@ class RouterService:
         self._async_calls: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._async_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="trp-async")
         self._async_result_ttl_ms = max(1000, int(async_result_ttl_sec * 1000))
+        self._async_execution_lease_ms = max(1000, int(async_execution_lease_sec * 1000))
         self._async_event_limit = max(1, int(async_event_limit))
         self._async_cleanup_interval_ms = max(1000, int(async_cleanup_interval_sec * 1000))
         self._async_last_cleanup_ms = 0
@@ -131,6 +136,27 @@ class RouterService:
         if existing is not None:
             status = existing.get("status")
             if status in {"QUEUED", "RUNNING"}:
+                if status == "RUNNING" and self._is_stale_async_lease(existing):
+                    self._set_async_call_state(
+                        session_id,
+                        call_id,
+                        {
+                            "status": "QUEUED",
+                            "updated_at": int(time.time() * 1000),
+                        },
+                    )
+                    self._append_async_event(
+                        session_id,
+                        call_id,
+                        {
+                            "kind": "STATE",
+                            "stage": "REQUEUED",
+                            "message": "stale async execution lease expired; requeued",
+                        },
+                    )
+                    worker_frame = self._clone_frame_for_async(frame)
+                    self._async_pool.submit(self._run_async_call, worker_frame)
+                    return self._ack(frame, call_id, status="ACCEPTED")
                 return self._ack(frame, call_id, status="IN_PROGRESS")
             if status in {"SUCCESS", "FAILED"}:
                 return self._res(
@@ -826,16 +852,27 @@ class RouterService:
         if not isinstance(session_id, str) or not isinstance(call_id, str):
             return
 
-        self._set_async_call_state(
-            session_id,
-            call_id,
-            {
-                "status": "RUNNING",
-                "result_frame_type": None,
-                "result_payload": None,
-                "updated_at": int(time.time() * 1000),
-            },
-        )
+        if self.runtime_state is not None:
+            claim = self.runtime_state.claim_async_execution(
+                session_id,
+                call_id,
+                worker_id=self._worker_id,
+                lease_ttl_sec=max(1, self._async_execution_lease_ms // 1000),
+                state_ttl_sec=max(1, self._async_result_ttl_ms // 1000),
+            )
+            if not bool(claim.get("claimed")):
+                return
+        else:
+            self._set_async_call_state(
+                session_id,
+                call_id,
+                {
+                    "status": "RUNNING",
+                    "result_frame_type": None,
+                    "result_payload": None,
+                    "updated_at": int(time.time() * 1000),
+                },
+            )
         self._append_async_event(
             session_id,
             call_id,
@@ -865,6 +902,8 @@ class RouterService:
                     "status": "SUCCESS",
                     "result_frame_type": "RESULT",
                     "result_payload": res["payload"],
+                    "execution_owner": None,
+                    "execution_lease_expires_at": None,
                     "updated_at": int(time.time() * 1000),
                 },
             )
@@ -900,6 +939,8 @@ class RouterService:
                     "status": "FAILED",
                     "result_frame_type": "NACK",
                     "result_payload": res["payload"],
+                    "execution_owner": None,
+                    "execution_lease_expires_at": None,
                     "updated_at": int(time.time() * 1000),
                 },
             )
@@ -917,9 +958,21 @@ class RouterService:
                     "message": f"unexpected async result frame_type: {res.get('frame_type')}",
                     "retryable": False,
                 },
+                "execution_owner": None,
+                "execution_lease_expires_at": None,
                 "updated_at": int(time.time() * 1000),
             },
         )
+
+    @staticmethod
+    def _is_stale_async_lease(state: Dict[str, Any]) -> bool:
+        try:
+            lease_exp = int(state.get("execution_lease_expires_at", 0))
+        except Exception:
+            lease_exp = 0
+        if lease_exp <= 0:
+            return False
+        return lease_exp <= int(time.time() * 1000)
 
     def _set_async_call_state(self, session_id: str, call_id: str, state: Dict[str, Any]) -> None:
         if self.runtime_state is not None:

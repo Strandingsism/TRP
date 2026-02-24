@@ -117,8 +117,10 @@ router_service = RouterService(
     runtime_state=runtime_state,
     call_record_ttl_sec=_env_int("TRP_CALL_RECORD_TTL_SEC", 86400),
     async_result_ttl_sec=_env_int("TRP_ASYNC_RESULT_TTL_SEC", 600),
+    async_execution_lease_sec=_env_int("TRP_ASYNC_EXECUTION_LEASE_SEC", 30),
     async_event_limit=_env_int("TRP_ASYNC_EVENT_LIMIT", 256),
     async_cleanup_interval_sec=_env_int("TRP_ASYNC_CLEANUP_INTERVAL_SEC", 30),
+    worker_id=os.getenv("TRP_ROUTER_WORKER_ID") or None,
 )
 
 

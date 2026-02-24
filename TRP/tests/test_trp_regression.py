@@ -31,6 +31,23 @@ class NullAuditLogger:
         return None
 
 
+class CountingSearchExecutor(BasicExecutor):
+    def __init__(self) -> None:
+        super().__init__()
+        import threading
+
+        self._lock = threading.Lock()
+        self.execute_count = 0
+
+    def execute(self, cap, native_args, timeout_ms):  # type: ignore[override]
+        if cap.cap_id == "cap.search.web.v1":
+            with self._lock:
+                self.execute_count += 1
+            # widen race window to exercise cross-instance claim
+            time.sleep(0.05)
+        return super().execute(cap, native_args, timeout_ms)
+
+
 @dataclass
 class FrameCtx:
     session_id: str
@@ -81,7 +98,13 @@ def _build_memory_service(*, policy: Optional[BasicPolicyEngine] = None) -> Rout
     )
 
 
-def _build_redis_service(*, prefix: str, approval_secret: Optional[str] = None) -> RouterService:
+def _build_redis_service(
+    *,
+    prefix: str,
+    approval_secret: Optional[str] = None,
+    executor: Optional[Any] = None,
+    worker_id: Optional[str] = None,
+) -> RouterService:
     redis = RedisRESPClient("redis://127.0.0.1:6379/0")
     registry = InMemoryCapabilityRegistry()
     return RouterService(
@@ -98,10 +121,11 @@ def _build_redis_service(*, prefix: str, approval_secret: Optional[str] = None) 
         ),
         idempotency=RedisIdempotencyStore(redis=redis, key_prefix=prefix),
         adapters=BasicAdapterRegistry(),
-        executor=BasicExecutor(),
+        executor=executor or BasicExecutor(),
         shaper=BasicResultShaper(),
         audit=NullAuditLogger(),
         runtime_state=RedisRuntimeStateStore(redis=redis, key_prefix=prefix),
+        worker_id=worker_id,
     )
 
 
@@ -548,3 +572,78 @@ def test_redis_async_event_append_is_atomic_under_concurrency() -> None:
     event_ids = [int(e["event_id"]) for e in events]
     assert len(set(event_ids)) == total
     assert sorted(event_ids) == list(range(1, total + 1))
+
+
+@pytest.mark.integration
+def test_redis_async_execution_claim_prevents_duplicate_worker_execution() -> None:
+    if not _redis_available():
+        pytest.skip("Redis not available on 127.0.0.1:6379")
+
+    prefix = f"trp_claim_{uuid.uuid4().hex[:8]}"
+    shared_executor = CountingSearchExecutor()
+    service_a = _build_redis_service(prefix=prefix, executor=shared_executor, worker_id="worker_a")
+    service_b = _build_redis_service(prefix=prefix, executor=shared_executor, worker_id="worker_b")
+
+    _, ctx = _hello_and_sync(service_a, agent_id="pytest_claim")
+    call_id = "call_claim_once"
+
+    # Seed async state as if ACK path accepted the call and queued background work.
+    service_a._set_async_call_state(  # type: ignore[attr-defined]
+        ctx.session_id,
+        call_id,
+        {
+            "status": "QUEUED",
+            "result_frame_type": None,
+            "result_payload": None,
+            "events": [],
+            "next_event_id": 1,
+            "updated_at": int(time.time() * 1000),
+        },
+    )
+    service_a._append_async_event(  # type: ignore[attr-defined]
+        ctx.session_id,
+        call_id,
+        {"kind": "STATE", "stage": "QUEUED", "message": "seeded for claim test"},
+    )
+
+    frame = {
+        "trp_version": "0.1",
+        "frame_type": "CALL_REQ",
+        "session_id": ctx.session_id,
+        "frame_id": f"frm_async_seed_{uuid.uuid4().hex[:8]}",
+        "trace_id": ctx.trace_id,
+        "timestamp_ms": int(time.time() * 1000),
+        "catalog_epoch": ctx.catalog_epoch,
+        "seq": ctx.seq,  # not used in _run_async_call
+        "payload": {
+            "call_id": call_id,
+            "idempotency_key": None,
+            "idx": 0,
+            "cap_id": "cap.search.web.v1",
+            "depends_on": [],
+            "attempt": 1,
+            "timeout_ms": 8000,
+            "approval_token": None,
+            "execution_mode": "ASYNC",
+            "args": {"query": "claim once", "top_k": 5},
+        },
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_a = pool.submit(service_a._run_async_call, dict(frame))  # type: ignore[attr-defined]
+        fut_b = pool.submit(service_b._run_async_call, dict(frame))  # type: ignore[attr-defined]
+        fut_a.result()
+        fut_b.result()
+
+    # Exactly one underlying executor execution should have happened.
+    assert shared_executor.execute_count == 1, shared_executor.execute_count
+
+    # Final state should be terminal success and queryable.
+    q = service_a.handle_frame(
+        ctx.next_frame(
+            frame_type="RESULT_QUERY_REQ",
+            payload={"call_id": call_id},
+        )
+    )
+    assert q["frame_type"] == "RESULT_QUERY_RES", q
+    assert q["payload"]["status"] == "SUCCESS", q

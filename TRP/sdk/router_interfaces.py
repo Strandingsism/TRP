@@ -120,6 +120,21 @@ class RuntimeStateStore(Protocol):
         """
         ...
 
+    def claim_async_execution(
+        self,
+        session_id: str,
+        call_id: str,
+        *,
+        worker_id: str,
+        lease_ttl_sec: int,
+        state_ttl_sec: int,
+    ) -> Dict[str, Any]:
+        """
+        原子尝试获取 async 执行权（claim/lease）。
+        返回 {"claimed": bool, "reason": "...", "state": {...}|None}
+        """
+        ...
+
 
 # ========= 参数语义映射 =========
 
