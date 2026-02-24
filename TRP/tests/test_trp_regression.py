@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -487,3 +488,63 @@ def test_redis_persistence_for_call_records_async_state_and_idempotency() -> Non
     assert res_write_replay["frame_type"] == "RESULT", res_write_replay
     replay_ticket_id = res_write_replay["payload"]["result"]["data"]["ticket_id"]
     assert replay_ticket_id == seed_ticket_id
+
+
+@pytest.mark.integration
+def test_redis_async_event_append_is_atomic_under_concurrency() -> None:
+    if not _redis_available():
+        pytest.skip("Redis not available on 127.0.0.1:6379")
+
+    prefix = f"trp_atomic_{uuid.uuid4().hex[:8]}"
+    store_a = RedisRuntimeStateStore(redis=RedisRESPClient("redis://127.0.0.1:6379/0"), key_prefix=prefix)
+    store_b = RedisRuntimeStateStore(redis=RedisRESPClient("redis://127.0.0.1:6379/0"), key_prefix=prefix)
+    session_id = "sess_atomic"
+    call_id = "call_atomic"
+
+    # Seed async state
+    seeded = store_a.merge_async_call_state(
+        session_id,
+        call_id,
+        {
+            "status": "RUNNING",
+            "result_frame_type": None,
+            "result_payload": None,
+            "events": [],
+            "next_event_id": 1,
+            "updated_at": int(time.time() * 1000),
+        },
+        ttl_sec=300,
+    )
+    assert seeded.get("next_event_id") == 1
+
+    workers = 8
+    per_worker = 25
+    total = workers * per_worker
+
+    def push_many(worker_id: int) -> None:
+        store = store_a if worker_id % 2 == 0 else store_b
+        for i in range(per_worker):
+            store.append_async_event(
+                session_id,
+                call_id,
+                {"kind": "STATE", "worker": worker_id, "i": i},
+                event_limit=2000,
+                ttl_sec=300,
+            )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(push_many, w) for w in range(workers)]
+        for fut in futs:
+            fut.result()
+
+    final_state = store_a.get_async_call_state(session_id, call_id)
+    assert final_state is not None
+    events = final_state.get("events", [])
+    assert isinstance(events, list)
+    assert len(events) == total, len(events)
+    next_event_id = int(final_state.get("next_event_id", 0))
+    assert next_event_id == total + 1, next_event_id
+
+    event_ids = [int(e["event_id"]) for e in events]
+    assert len(set(event_ids)) == total
+    assert sorted(event_ids) == list(range(1, total + 1))

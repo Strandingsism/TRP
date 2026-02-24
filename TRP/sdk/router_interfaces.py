@@ -99,6 +99,27 @@ class RuntimeStateStore(Protocol):
     def put_async_call_state(self, session_id: str, call_id: str, state: Dict[str, Any], ttl_sec: int) -> None:
         ...
 
+    def merge_async_call_state(self, session_id: str, call_id: str, patch: Dict[str, Any], ttl_sec: int) -> Dict[str, Any]:
+        """
+        原子合并 async state patch，返回合并后的完整 state。
+        多实例场景下应避免 get-modify-set 丢更新。
+        """
+        ...
+
+    def append_async_event(
+        self,
+        session_id: str,
+        call_id: str,
+        event: Dict[str, Any],
+        *,
+        event_limit: int,
+        ttl_sec: int,
+    ) -> Dict[str, Any]:
+        """
+        原子追加 async event，并维护 event_id / trim / ttl，返回更新后的完整 state。
+        """
+        ...
+
 
 # ========= 参数语义映射 =========
 

@@ -923,22 +923,16 @@ class RouterService:
 
     def _set_async_call_state(self, session_id: str, call_id: str, state: Dict[str, Any]) -> None:
         if self.runtime_state is not None:
-            with self._async_calls_lock:
-                existing = self.runtime_state.get_async_call_state(session_id, call_id) or {}
-                merged = dict(existing)
-                merged.update(state)
-                if "events" in existing and "events" not in state:
-                    merged["events"] = existing["events"]
-                if "next_event_id" in existing and "next_event_id" not in state:
-                    merged["next_event_id"] = existing["next_event_id"]
-                updated_at = int(merged.get("updated_at", int(time.time() * 1000)))
-                merged["expires_at"] = updated_at + self._async_result_ttl_ms
-                self.runtime_state.put_async_call_state(
-                    session_id,
-                    call_id,
-                    merged,
-                    ttl_sec=max(1, self._async_result_ttl_ms // 1000),
-                )
+            patch = dict(state)
+            updated_at = int(patch.get("updated_at", int(time.time() * 1000)))
+            patch["updated_at"] = updated_at
+            patch["expires_at"] = updated_at + self._async_result_ttl_ms
+            self.runtime_state.merge_async_call_state(
+                session_id,
+                call_id,
+                patch,
+                ttl_sec=max(1, self._async_result_ttl_ms // 1000),
+            )
             return
         with self._async_calls_lock:
             s = self._async_calls.setdefault(session_id, {})
@@ -987,27 +981,15 @@ class RouterService:
     def _append_async_event(self, session_id: str, call_id: str, event: Dict[str, Any]) -> None:
         now_ms = int(time.time() * 1000)
         if self.runtime_state is not None:
-            with self._async_calls_lock:
-                rec = self.runtime_state.get_async_call_state(session_id, call_id) or {}
-                events = rec.setdefault("events", [])
-                next_event_id = int(rec.get("next_event_id", 1))
-                event_rec = dict(event)
-                event_rec["event_id"] = next_event_id
-                event_rec.setdefault("timestamp_ms", now_ms)
-                events.append(event_rec)
-                if len(events) > self._async_event_limit:
-                    overflow = len(events) - self._async_event_limit
-                    del events[:overflow]
-                    rec["dropped_event_count"] = int(rec.get("dropped_event_count", 0)) + overflow
-                rec["next_event_id"] = next_event_id + 1
-                rec["updated_at"] = now_ms
-                rec["expires_at"] = now_ms + self._async_result_ttl_ms
-                self.runtime_state.put_async_call_state(
-                    session_id,
-                    call_id,
-                    rec,
-                    ttl_sec=max(1, self._async_result_ttl_ms // 1000),
-                )
+            event_rec = dict(event)
+            event_rec.setdefault("timestamp_ms", now_ms)
+            self.runtime_state.append_async_event(
+                session_id,
+                call_id,
+                event_rec,
+                event_limit=self._async_event_limit,
+                ttl_sec=max(1, self._async_result_ttl_ms // 1000),
+            )
             return
         with self._async_calls_lock:
             s = self._async_calls.setdefault(session_id, {})

@@ -350,6 +350,69 @@ class RedisRuntimeStateStore(RuntimeStateStore):
         self._redis = redis
         self._prefix = key_prefix.strip() or "trp"
 
+    _MERGE_ASYNC_STATE_LUA = """
+local key = KEYS[1]
+local patch_json = ARGV[1]
+local ttl_ms = tonumber(ARGV[2])
+
+local rec = {}
+local raw = redis.call('GET', key)
+if raw then
+  rec = cjson.decode(raw)
+end
+local patch = cjson.decode(patch_json)
+
+for k, v in pairs(patch) do
+  rec[k] = v
+end
+
+if rec['events'] == nil then rec['events'] = {} end
+if rec['next_event_id'] == nil then rec['next_event_id'] = 1 end
+
+redis.call('SET', key, cjson.encode(rec), 'PX', ttl_ms)
+return cjson.encode(rec)
+"""
+
+    _APPEND_ASYNC_EVENT_LUA = """
+local key = KEYS[1]
+local event_json = ARGV[1]
+local event_limit = tonumber(ARGV[2])
+local ttl_ms = tonumber(ARGV[3])
+local now_ms = tonumber(ARGV[4])
+local ttl_window_ms = tonumber(ARGV[5])
+
+local rec = {}
+local raw = redis.call('GET', key)
+if raw then
+  rec = cjson.decode(raw)
+end
+if rec['events'] == nil then rec['events'] = {} end
+if rec['next_event_id'] == nil then rec['next_event_id'] = 1 end
+
+local ev = cjson.decode(event_json)
+ev['event_id'] = rec['next_event_id']
+if ev['timestamp_ms'] == nil then ev['timestamp_ms'] = now_ms end
+
+table.insert(rec['events'], ev)
+
+local n = #rec['events']
+if n > event_limit then
+  local overflow = n - event_limit
+  for i = 1, overflow do
+    table.remove(rec['events'], 1)
+  end
+  local dropped = tonumber(rec['dropped_event_count'] or 0)
+  rec['dropped_event_count'] = dropped + overflow
+end
+
+rec['next_event_id'] = tonumber(rec['next_event_id']) + 1
+rec['updated_at'] = now_ms
+rec['expires_at'] = now_ms + ttl_window_ms
+
+redis.call('SET', key, cjson.encode(rec), 'PX', ttl_ms)
+return cjson.encode(rec)
+"""
+
     def get_call_record(self, session_id: str, call_id: str) -> Optional[Dict[str, Any]]:
         raw = self._redis.execute("GET", self._call_record_key(session_id, call_id))
         return self._loads_obj(raw)
@@ -363,6 +426,45 @@ class RedisRuntimeStateStore(RuntimeStateStore):
 
     def put_async_call_state(self, session_id: str, call_id: str, state: Dict[str, Any], ttl_sec: int) -> None:
         self._set_json(self._async_state_key(session_id, call_id), state, ttl_sec)
+
+    def merge_async_call_state(self, session_id: str, call_id: str, patch: Dict[str, Any], ttl_sec: int) -> Dict[str, Any]:
+        ttl_ms = max(1000, int(ttl_sec * 1000))
+        patch_json = json.dumps(patch, ensure_ascii=False, separators=(",", ":"))
+        raw = self._redis.execute(
+            "EVAL",
+            self._MERGE_ASYNC_STATE_LUA,
+            1,
+            self._async_state_key(session_id, call_id),
+            patch_json,
+            ttl_ms,
+        )
+        return self._loads_obj(raw) or {}
+
+    def append_async_event(
+        self,
+        session_id: str,
+        call_id: str,
+        event: Dict[str, Any],
+        *,
+        event_limit: int,
+        ttl_sec: int,
+    ) -> Dict[str, Any]:
+        ttl_ms = max(1000, int(ttl_sec * 1000))
+        now_ms = int(time.time() * 1000)
+        ttl_window_ms = ttl_ms
+        event_json = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        raw = self._redis.execute(
+            "EVAL",
+            self._APPEND_ASYNC_EVENT_LUA,
+            1,
+            self._async_state_key(session_id, call_id),
+            event_json,
+            max(1, int(event_limit)),
+            ttl_ms,
+            now_ms,
+            ttl_window_ms,
+        )
+        return self._loads_obj(raw) or {}
 
     def _set_json(self, key: str, obj: Dict[str, Any], ttl_sec: int) -> None:
         ttl_ms = max(1000, int(ttl_sec * 1000))
