@@ -407,12 +407,16 @@ def test_metrics_collector_renders_prometheus_text() -> None:
         error_class="SCHEMA_MISMATCH",
         error_code="TRP_2000",
     )
+    m.observe_audit_event(event_name="call.async_lease_renewed")
+    m.observe_audit_event(event_name="call.async_lease_lost")
     out = m.render_prometheus()
     assert "trp_router_info" in out
     assert 'trp_router_ready ' in out
     assert 'trp_http_requests_total{path="/trp/frame",status_code="200"}' in out
     assert 'trp_frames_total{request_frame_type="CALL_REQ",response_frame_type="NACK"}' in out
     assert 'trp_nacks_total{error_class="SCHEMA_MISMATCH",error_code="TRP_2000"}' in out
+    assert 'trp_audit_events_total{event_name="call.async_lease_renewed"}' in out
+    assert 'trp_async_lease_events_total{action="lost"}' in out
 
 
 @pytest.mark.integration
@@ -764,3 +768,86 @@ def test_redis_async_execution_lease_renew_prevents_steal_after_lease_window() -
     q = service_a.handle_frame(ctx.next_frame(frame_type="RESULT_QUERY_REQ", payload={"call_id": call_id}))
     assert q["frame_type"] == "RESULT_QUERY_RES", q
     assert q["payload"]["status"] == "SUCCESS", q
+
+
+@pytest.mark.integration
+def test_redis_async_stale_lease_requeue_and_takeover_via_public_async_call() -> None:
+    if not _redis_available():
+        pytest.skip("Redis not available on 127.0.0.1:6379")
+
+    prefix = f"trp_failover_{uuid.uuid4().hex[:8]}"
+    shared_executor = CountingSearchExecutor()
+    service_a = _build_redis_service(
+        prefix=prefix,
+        executor=shared_executor,
+        worker_id="worker_a",
+        async_execution_lease_sec=1,
+        async_execution_heartbeat_sec=0.2,
+    )
+    service_b = _build_redis_service(
+        prefix=prefix,
+        executor=shared_executor,
+        worker_id="worker_b",
+        async_execution_lease_sec=1,
+        async_execution_heartbeat_sec=0.2,
+    )
+
+    _, ctx = _hello_and_sync(service_a, agent_id="pytest_failover_public")
+    call_id = "call_failover_public"
+
+    # Seed accepted async state (simulating ACK path before background execution starts).
+    service_a._set_async_call_state(  # type: ignore[attr-defined]
+        ctx.session_id,
+        call_id,
+        {
+            "status": "QUEUED",
+            "result_frame_type": None,
+            "result_payload": None,
+            "events": [],
+            "next_event_id": 1,
+            "updated_at": int(time.time() * 1000),
+        },
+    )
+    service_a._append_async_event(  # type: ignore[attr-defined]
+        ctx.session_id,
+        call_id,
+        {"kind": "STATE", "stage": "QUEUED", "message": "seeded for failover test"},
+    )
+
+    # Simulate instance A claiming the task and then crashing (no heartbeat, no execution).
+    assert service_a.runtime_state is not None
+    claim = service_a.runtime_state.claim_async_execution(
+        ctx.session_id,
+        call_id,
+        worker_id="worker_a",
+        lease_ttl_sec=1,
+        state_ttl_sec=300,
+    )
+    assert claim.get("claimed") is True, claim
+
+    # Let lease expire; instance B should detect stale RUNNING lease and requeue/execute.
+    time.sleep(1.25)
+
+    ack = service_b.handle_frame(
+        ctx.next_frame(
+            frame_type="CALL_REQ",
+            payload={
+                "call_id": call_id,
+                "idempotency_key": None,
+                "idx": 0,
+                "cap_id": "cap.search.web.v1",
+                "depends_on": [],
+                "attempt": 1,
+                "timeout_ms": 8000,
+                "approval_token": None,
+                "execution_mode": "ASYNC",
+                "args": {"query": "public failover takeover", "top_k": 5},
+            },
+        )
+    )
+    assert ack["frame_type"] == "ACK", ack
+    assert ack["payload"]["status"] == "ACCEPTED", ack
+
+    done = _wait_async_final(service_b, ctx, call_id=call_id)
+    assert done["final"]["payload"]["status"] == "SUCCESS", done["final"]
+    assert shared_executor.execute_count == 1, shared_executor.execute_count

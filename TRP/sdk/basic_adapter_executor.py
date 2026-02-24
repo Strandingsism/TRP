@@ -133,15 +133,17 @@ class BasicExecutor(Executor):
     - 搜索/查询返回 mock 数据
     - ticket_create / record_delete 维护内存状态，便于测试幂等和审批
     """
-    def __init__(self):
+    def __init__(self, *, base_sleep_sec: float = 0.01):
         self._tickets: Dict[str, Dict[str, Any]] = {}
         self._deleted: List[Dict[str, Any]] = []
+        self._base_sleep_sec = max(0.0, float(base_sleep_sec))
 
     def execute(self, cap: CapabilityMeta, native_args: Dict[str, Any], timeout_ms: int) -> Dict[str, Any]:
         # 这里可模拟耗时
         if timeout_ms < 5:
             raise TimeoutError("timeout too small")
-        time.sleep(0.01)
+        if self._base_sleep_sec > 0:
+            time.sleep(self._base_sleep_sec)
 
         if cap.cap_id == "cap.search.web.v1":
             q = native_args["q"]

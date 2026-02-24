@@ -11,7 +11,6 @@ from sdk.in_memory_impl import (
     InMemoryCapabilityRegistry,
     InMemorySessionManager,
     InMemoryIdempotencyStore,
-    PrintAuditLogger,
 )
 from sdk.redis_impl import (
     RedisRESPClient,
@@ -26,7 +25,7 @@ from sdk.basic_adapter_executor import (
 )
 from sdk.basic_policy import BasicPolicyEngine
 from sdk.frame_validation import TRPFrameValidationError, validate_trp_frame
-from sdk.observability import TRPMetrics
+from sdk.observability import TRPMetrics, MetricsAuditLogger, JsonStdoutAuditLogger, CompositeAuditLogger
 from sdk.router_service import RouterService
 
 app = FastAPI(title="TRP Router v0.1")
@@ -85,13 +84,15 @@ def _schema_nack(raw_frame: Any, message: str, error_code: str = "TRP_2000") -> 
 
 # 组装（Composition Root / 依赖注入）
 registry = InMemoryCapabilityRegistry()
-audit = PrintAuditLogger()
-
 state_backend = str(os.getenv("TRP_STATE_BACKEND", "memory")).strip().lower()
 redis_url = os.getenv("TRP_REDIS_URL", "redis://127.0.0.1:6379/0")
 redis_prefix = str(os.getenv("TRP_REDIS_PREFIX", "trp")).strip() or "trp"
 redis_client = None
 metrics = TRPMetrics(backend=state_backend)
+audit = CompositeAuditLogger(
+    JsonStdoutAuditLogger(enabled=_env_bool("TRP_AUDIT_STDOUT", True)),
+    MetricsAuditLogger(metrics),
+)
 
 if state_backend == "redis":
     redis_client = RedisRESPClient(redis_url, timeout_sec=float(os.getenv("TRP_REDIS_TIMEOUT_SEC", "2")))
@@ -126,7 +127,7 @@ router_service = RouterService(
     ),
     idempotency=idempotency,
     adapters=BasicAdapterRegistry(),
-    executor=BasicExecutor(),
+    executor=BasicExecutor(base_sleep_sec=_env_int("TRP_EXECUTOR_BASE_SLEEP_MS", 10, min_value=0) / 1000.0),
     shaper=BasicResultShaper(),
     audit=audit,
     runtime_state=runtime_state,

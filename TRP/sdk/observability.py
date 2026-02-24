@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
+import sys
 import threading
 import time
 from collections import Counter
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 
 LabelTuple = Tuple[Tuple[str, str], ...]
@@ -58,6 +60,13 @@ class TRPMetrics:
     def set_readiness(self, *, ready: bool) -> None:
         self._set_gauge("trp_router_ready", 1.0 if ready else 0.0)
 
+    def observe_audit_event(self, *, event_name: str) -> None:
+        with self._lock:
+            self._counters[("trp_audit_events_total", _labels(event_name=event_name))] += 1
+            lease_action = _lease_action_from_event_name(event_name)
+            if lease_action is not None:
+                self._counters[("trp_async_lease_events_total", _labels(action=lease_action))] += 1
+
     def render_prometheus(self) -> str:
         with self._lock:
             lines: list[str] = []
@@ -90,6 +99,10 @@ class TRPMetrics:
                 "# TYPE trp_frame_latency_ms_sum counter",
                 "# HELP trp_nacks_total Total NACKs by error class/code",
                 "# TYPE trp_nacks_total counter",
+                "# HELP trp_audit_events_total Total audit events by event name",
+                "# TYPE trp_audit_events_total counter",
+                "# HELP trp_async_lease_events_total Async execution lease events by action",
+                "# TYPE trp_async_lease_events_total counter",
             ]
         )
 
@@ -113,3 +126,63 @@ class TRPMetrics:
 
 def _escape_label(v: str) -> str:
     return v.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def _lease_action_from_event_name(event_name: str) -> Optional[str]:
+    mapping = {
+        "call.async_lease_renewed": "renewed",
+        "call.async_lease_lost": "lost",
+        "call.async_lease_renew_error": "renew_error",
+    }
+    return mapping.get(event_name)
+
+
+class MetricsAuditLogger:
+    def __init__(self, metrics: TRPMetrics):
+        self._metrics = metrics
+
+    def log_event(self, event_name: str, payload: Dict[str, Any]) -> None:
+        self._metrics.observe_audit_event(event_name=event_name)
+
+
+class JsonStdoutAuditLogger:
+    """
+    结构化 stdout 日志（单行 JSON），便于本机和容器环境直接采集。
+    """
+
+    def __init__(self, *, enabled: bool = True):
+        self._enabled = bool(enabled)
+
+    def log_event(self, event_name: str, payload: Dict[str, Any]) -> None:
+        if not self._enabled:
+            return
+        rec = {
+            "timestamp_ms": int(time.time() * 1000),
+            "event_name": event_name,
+            "payload": payload,
+        }
+        try:
+            line = json.dumps(rec, ensure_ascii=False, default=str, separators=(",", ":"))
+        except Exception:
+            line = json.dumps(
+                {
+                    "timestamp_ms": rec["timestamp_ms"],
+                    "event_name": event_name,
+                    "payload": str(payload),
+                },
+                ensure_ascii=False,
+            )
+        print(line, file=sys.stdout, flush=False)
+
+
+class CompositeAuditLogger:
+    def __init__(self, *loggers: Any):
+        self._loggers = [x for x in loggers if x is not None]
+
+    def log_event(self, event_name: str, payload: Dict[str, Any]) -> None:
+        for logger in self._loggers:
+            try:
+                logger.log_event(event_name, payload)
+            except Exception:
+                # 审计失败不影响主流程
+                continue

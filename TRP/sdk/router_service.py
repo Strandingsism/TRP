@@ -145,6 +145,20 @@ class RouterService:
         if existing is not None:
             status = existing.get("status")
             if status in {"QUEUED", "RUNNING"}:
+                if status == "QUEUED":
+                    # 允许重复 ASYNC 调用触发 redrive；真正执行去重由 claim_async_execution 保证。
+                    worker_frame = self._clone_frame_for_async(frame)
+                    self._async_pool.submit(self._run_async_call, worker_frame)
+                    self._append_async_event(
+                        session_id,
+                        call_id,
+                        {
+                            "kind": "STATE",
+                            "stage": "REDRIVE",
+                            "message": "duplicate async call redrives queued task",
+                        },
+                    )
+                    return self._ack(frame, call_id, status="ACCEPTED")
                 if status == "RUNNING" and self._is_stale_async_lease(existing):
                     self._set_async_call_state(
                         session_id,
@@ -895,6 +909,14 @@ class RouterService:
                         },
                     )
                     return
+                self.audit.log_event(
+                    "call.async_lease_renewed",
+                    {
+                        "session_id": session_id,
+                        "call_id": call_id,
+                        "worker_id": self._worker_id,
+                    },
+                )
 
         t = threading.Thread(
             target=_loop,

@@ -126,6 +126,7 @@ def run_worker(
     mode: str,
     top_k: int,
     poll_interval_sec: float,
+    duration_sec: Optional[float],
 ) -> Dict[str, Any]:
     http = requests.Session()
     ctx = hello_and_sync(http, base_url, timeout_sec, agent_id=f"bench_w{worker_idx}")
@@ -134,8 +135,16 @@ def run_worker(
     failed = 0
     nacks = 0
     errors: List[str] = []
+    attempted = 0
 
-    for i in range(calls_per_worker):
+    deadline = (time.time() + float(duration_sec)) if duration_sec and duration_sec > 0 else None
+    i = 0
+    while True:
+        if deadline is not None and time.time() >= deadline:
+            break
+        if deadline is None and i >= calls_per_worker:
+            break
+        attempted += 1
         call_id = f"w{worker_idx}_c{i}_{uuid.uuid4().hex[:6]}"
         query = f"bench worker {worker_idx} call {i}"
         frame = ctx.next_frame(
@@ -186,9 +195,11 @@ def run_worker(
         except Exception as e:
             failed += 1
             errors.append(type(e).__name__)
+        i += 1
     http.close()
     return {
         "worker": worker_idx,
+        "attempted": attempted,
         "latencies_ms": latencies_ms,
         "success": success,
         "failed": failed,
@@ -215,6 +226,7 @@ def main() -> None:
     ap.add_argument("--base-url", default="http://127.0.0.1:8000")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--calls-per-worker", type=int, default=50)
+    ap.add_argument("--duration-sec", type=float, default=0.0, help="Run each worker for duration instead of fixed calls")
     ap.add_argument("--mode", choices=["sync", "async"], default="sync")
     ap.add_argument("--timeout-sec", type=float, default=10.0)
     ap.add_argument("--poll-interval-sec", type=float, default=0.03)
@@ -234,6 +246,7 @@ def main() -> None:
                 mode=args.mode,
                 top_k=args.top_k,
                 poll_interval_sec=args.poll_interval_sec,
+                duration_sec=(args.duration_sec if args.duration_sec > 0 else None),
             )
             for w in range(args.workers)
         ]
@@ -245,13 +258,14 @@ def main() -> None:
     success = sum(int(wr["success"]) for wr in worker_results)
     failed = sum(int(wr["failed"]) for wr in worker_results)
     nacks = sum(int(wr["nacks"]) for wr in worker_results)
-    total_attempts = args.workers * args.calls_per_worker
+    total_attempts = sum(int(wr.get("attempted", 0)) for wr in worker_results)
 
     summary = {
         "mode": args.mode,
         "base_url": args.base_url,
         "workers": args.workers,
         "calls_per_worker": args.calls_per_worker,
+        "duration_sec": round(args.duration_sec, 3),
         "attempted_calls": total_attempts,
         "completed_measurements": len(latencies),
         "success": success,
