@@ -2,8 +2,6 @@
 
 TRP routes all tool use through a single stable interface (`router`). The router handles capability orchestration, policy checks, idempotency, and batch execution so the model does not need to manage a large and unstable tool surface directly.
 
-This `TRP` directory is self-contained for runtime use. It no longer depends on `learn_claude_code` for the Qwen comparison path.
-
 ## 1. Benchmark Results
 
 ### 1.1 Tau2 (airline + retail, base split, num_trials=4)
