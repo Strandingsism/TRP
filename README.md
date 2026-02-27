@@ -1,19 +1,21 @@
 # TRP (Tool Routing Protocol) v2.0
 
-TRP 的核心思路是让 LLM 只调用一个稳定入口（`router`），由 Router 侧负责能力编排、策略校验、幂等与批处理执行，降低模型侧工具选择与参数漂移带来的不稳定性。
+TRP routes all tool use through a single stable interface (`router`). The router handles capability orchestration, policy checks, idempotency, and batch execution so the model does not need to manage a large and unstable tool surface directly.
 
-## 1. 实测结果（先看结论）
+This `TRP` directory is self-contained for runtime use. It no longer depends on `learn_claude_code` for the Qwen comparison path.
 
-### 1.1 Tau2（airline + retail, base, num_trials=4）
+## 1. Benchmark Results
 
-结果文件：
-- `results/tau2/summary_compare_tau2_trp_vs_traditional.json`
-- `results/tau2/traditional_airline_base_trials4.json`
-- `results/tau2/traditional_retail_base_trials4.json`
-- `results/tau2/trp_airline_base_trials4.json`
-- `results/tau2/trp_retail_base_trials4.json`
+### 1.1 Tau2 (airline + retail, base split, num_trials=4)
 
-关键指标（同模型、同 seed、同任务集，仅 agent 实现不同）：
+Result files:
+- `tests/results/tau2/summary_compare_tau2_trp_vs_traditional.json`
+- `tests/results/tau2/traditional_airline_base_trials4.json`
+- `tests/results/tau2/traditional_retail_base_trials4.json`
+- `tests/results/tau2/trp_airline_base_trials4.json`
+- `tests/results/tau2/trp_retail_base_trials4.json`
+
+Key metrics (same model, same seed, same task set, only agent style differs):
 
 | Domain | Method | Pass@1 | Avg Tokens / Sim | Avg Duration / Sim |
 |---|---:|---:|---:|---:|
@@ -22,40 +24,40 @@ TRP 的核心思路是让 LLM 只调用一个稳定入口（`router`），由 Ro
 | retail | traditional | 0.7697 | 98,501.87 | 169.41s |
 | retail | TRP | 0.7829 | 70,065.34 | 203.23s |
 
-总览（airline+retail，共 656 simulations）：
-- Success rate: traditional `475/656 = 72.41%`，TRP `483/656 = 73.63%`（+1.22pp）
-- Total tokens: traditional `71,844,021`，TRP `48,510,003`（约 `-32.5%`）
-- LLM-visible tool calls: traditional `5,598`，TRP `3,730`（约 `-33.4%`）
-- 总时长：TRP 更高（主要受路由层编排与 batch/async 策略影响）
+Overall (airline + retail, 656 simulations):
+- Success rate: traditional `475/656 = 72.41%`, TRP `483/656 = 73.63%` (+1.22pp)
+- Total tokens: traditional `71,844,021`, TRP `48,510,003` (about `-32.5%`)
+- LLM-visible tool calls: traditional `5,598`, TRP `3,730` (about `-33.4%`)
+- End-to-end runtime: TRP is higher in this setup (mainly due to router-side orchestration and batch/async control paths)
 
-### 1.2 Showcase24（本地可复现实验集）
+### 1.2 Showcase24 (local reproducible workload)
 
-结果文件：
-- `results/showcase24_full.json`
-- `results/showcase24_batch5_smoke.json`
+Result files:
+- `tests/results/showcase24_full.json`
+- `tests/results/showcase24_batch5_smoke.json`
 
-本次运行配置（2026-02-27，本地）：
+Run configuration (local run on February 27, 2026):
 - `task_profile=showcase24`
-- `mode=both`（traditional vs trp）
+- `mode=both` (traditional vs TRP)
 - `model=qwen-plus`
 - `router_url=http://127.0.0.1:8000`
 
-汇总：
-- Traditional: `22/24`，success_rate `0.9167`
-- TRP: `24/24`，success_rate `1.0000`
-- 平均延迟：traditional `4919.54ms`，TRP `3282.72ms`（TRP 更快）
-- 平均 LLM 可见工具调用：traditional `3.17`，TRP `1.58`
-- 平均 token / task：traditional `2006.50`，TRP `1762.42`
+Summary:
+- Traditional: `22/24`, success_rate `0.9167`
+- TRP: `24/24`, success_rate `1.0000`
+- Avg latency: traditional `4919.54ms`, TRP `3282.72ms` (TRP faster here)
+- Avg LLM-visible tool calls: traditional `3.17`, TRP `1.58`
+- Avg tokens / task: traditional `2006.50`, TRP `1762.42`
 
-失败任务（traditional）：
+Failed tasks (traditional):
 - `batch_search_six_queries_eval`
 - `batch_search_five_queries_ops`
 
-## 2. Showcase24 任务构成（24 个）
+## 2. Showcase24 Task List (24)
 
-定义位置：`TRP/tests/compare_qwen_tool_use.py`
+Defined in `tests/compare_qwen_tool_use.py`.
 
-### basic（10）
+### basic (10)
 - `search_titles`
 - `search_titles_ptc`
 - `search_single_hit`
@@ -67,14 +69,14 @@ TRP 的核心思路是让 LLM 只调用一个稳定入口（`router`），由 Ro
 - `combo_sql_then_search`
 - `combo_three_reads`
 
-### batch（5）
+### batch (5)
 - `batch_search_three_queries`
 - `batch_search_four_queries`
 - `batch_search_compare_queries`
 - `batch_search_then_doc`
 - `batch_search_five_queries`
 
-### extra batch（9）
+### extra batch (9)
 - `batch_search_six_queries_proto`
 - `batch_search_six_queries_eval`
 - `batch_search_doc_combo_1`
@@ -85,18 +87,18 @@ TRP 的核心思路是让 LLM 只调用一个稳定入口（`router`），由 Ro
 - `batch_search_five_queries_ctx`
 - `batch_search_four_queries_safety`
 
-## 3. TRP 协议与实现
+## 3. Protocol and Architecture
 
-## 3.1 协议目标
-- 把“工具发现/选择/重试/审批/幂等”从 LLM prompt 侧下沉到 Router
-- 让 LLM 只记一个入口，减少多工具 schema 漂移对行为的影响
-- 支持同步 + 异步 + 批处理 + 部分结果查询
+### 3.1 Protocol goals
+- Move tool selection, retries, approvals, and idempotency from prompt logic to router logic
+- Keep a single stable model-facing interface
+- Support sync calls, async calls, batching, and partial result polling
 
-## 3.2 帧模型（TRP v0.1）
+### 3.2 Frame model (TRP v0.1)
 
-严格校验定义：`TRP/sdk/frame_validation.py`
+Strict validation is implemented in `sdk/frame_validation.py`.
 
-请求帧：
+Request frames:
 - `HELLO_REQ`
 - `CATALOG_SYNC_REQ`
 - `CAP_QUERY_REQ`
@@ -104,90 +106,134 @@ TRP 的核心思路是让 LLM 只调用一个稳定入口（`router`），由 Ro
 - `CALL_BATCH_REQ`
 - `RESULT_QUERY_REQ`
 
-关键字段：
+Core fields:
 - `trp_version`, `frame_type`, `session_id`, `frame_id`, `trace_id`, `timestamp_ms`, `catalog_epoch`, `seq`, `payload`
 
-说明：
-- `HELLO_REQ` 必须 `session_id/catalog_epoch/seq` 为空
-- 其他请求必须携带有效 `session_id + catalog_epoch + seq`
-- Pydantic strict + `extra=forbid`，防止静默吞字段
+Validation invariants:
+- `HELLO_REQ` must have `session_id/catalog_epoch/seq = null`
+- All other request frames require valid `session_id + catalog_epoch + seq`
+- Pydantic strict validation with `extra=forbid` prevents silent field drift
 
-## 3.3 Router 工作流
+### 3.3 Router workflow
 
-主实现：`TRP/sdk/router_service.py`  
-服务入口：`TRP/app/app.py`
+Main implementation: `sdk/router_service.py`  
+Service entrypoint: `app/app.py`
 
-流程（简化）：
-1. `HELLO_REQ` 建立或恢复 session，返回 `session_id / catalog_epoch / seq_start / features`
-2. `CATALOG_SYNC_REQ` 同步能力目录（idx <-> cap_id）
-3. `CALL_REQ` / `CALL_BATCH_REQ` 执行调用
-4. 通过 Policy/Adapter/Executor/Shaper 链路完成校验与执行
-5. 若异步执行，返回 ACK，后续用 `RESULT_QUERY_REQ` 拉取最终结果或 `PARTIAL_RESULT`
+Simplified flow:
+1. `HELLO_REQ` creates or resumes a session and returns `session_id / catalog_epoch / seq_start / features`
+2. `CATALOG_SYNC_REQ` returns capability aliases (`idx <-> cap_id`)
+3. `CALL_REQ` / `CALL_BATCH_REQ` executes capability calls
+4. Policy, adapter, executor, and result shaping run in sequence
+5. For async calls, router returns ACK and later serves terminal or partial results via `RESULT_QUERY_REQ`
 
-链路组件：
-- Capability registry: `TRP/sdk/in_memory_impl.py`
-- Policy engine: `TRP/sdk/basic_policy.py`
-- Adapter/Executor/Shaper: `TRP/sdk/basic_adapter_executor.py`
-- Redis 持久化实现: `TRP/sdk/redis_impl.py`
+Core components:
+- Capability registry: `sdk/in_memory_impl.py`
+- Policy engine: `sdk/basic_policy.py`
+- Adapter/executor/shaper: `sdk/basic_adapter_executor.py`
+- Redis-backed persistence: `sdk/redis_impl.py`
 
-## 3.4 核心机制
-- 顺序保障：`seq` 检查，乱序返回 NACK
-- 重放保护：`frame_id` 去重
-- 幂等保障：`idempotency_key` 缓存结果
-- 目录一致性：`catalog_epoch` 不一致触发重同步
-- 策略审批：`HIGH/CRITICAL` 风险能力可要求 `approval_token`
-- 批处理：`CALL_BATCH_REQ` 支持并行/串行执行
-- 异步续跑：`CALL_REQ(execution_mode=ASYNC)` + `RESULT_QUERY_REQ`
+### 3.4 Core reliability mechanisms
+- Ordering guard: `seq` check, out-of-order requests return NACK
+- Replay protection: dedupe by `frame_id`
+- Idempotency: cache by `idempotency_key`
+- Catalog consistency: detect stale `catalog_epoch` and force resync
+- Approval policy: `HIGH/CRITICAL` capabilities can require `approval_token`
+- Batch execution: `CALL_BATCH_REQ` supports parallel and sequential modes
+- Async continuation: `CALL_REQ(execution_mode=ASYNC)` + `RESULT_QUERY_REQ`
 
-## 4. 如何复现
+## 4. Reproducibility
 
-## 4.1 环境准备
+### 4.1 Environment setup
 
-1. 安装依赖（示例）：
+1. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-2. 准备 `.env`（至少）：
+2. Create `.env` from template:
 ```bash
-QWEN_API_KEY=...
-MODEL_ID=qwen-plus
-QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+cp .env.example .env
 ```
 
-3. Windows PowerShell 避免中文乱码：
+3. Prepare `.env` (minimum):
+```bash
+TRP_API_KEY=...
+TRP_BASE_URL=...
+TRP_MODEL_ID=...
+```
+
+4. On Windows PowerShell, force UTF-8 output:
 ```powershell
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 ```
 
-## 4.2 启动 TRP Router
+### 4.2 Start TRP router
 
 ```bash
-cd TRP
 uvicorn app.app:app --host 127.0.0.1 --port 8000
 ```
 
-健康检查：
+Health checks:
 ```bash
 curl http://127.0.0.1:8000/healthz
 curl http://127.0.0.1:8000/readyz
 ```
 
-## 4.3 跑 Showcase24 对比
+### 4.3 Run with Docker
+
+TRP does not require Docker to run, but Docker is useful for consistent startup and Redis persistence.
+
+1. Router only (in-memory state):
+```bash
+docker run --rm -it -p 8000:8000 \
+  -v ${PWD}:/app -w /app \
+  python:3.12-slim \
+  sh -lc "pip install fastapi uvicorn pydantic requests python-dotenv openai && uvicorn app.app:app --host 0.0.0.0 --port 8000"
+```
+
+Windows PowerShell equivalent:
+```powershell
+docker run --rm -it -p 8000:8000 `
+  -v ${PWD}:/app -w /app `
+  python:3.12-slim `
+  sh -lc "pip install fastapi uvicorn pydantic requests python-dotenv openai && uvicorn app.app:app --host 0.0.0.0 --port 8000"
+```
+
+2. Start Redis (for persistent runtime state):
+```bash
+docker run -d --name trp-redis -p 6379:6379 redis:7-alpine
+```
+
+3. Router with Redis backend:
+```bash
+TRP_STATE_BACKEND=redis TRP_REDIS_URL=redis://127.0.0.1:6379/0 \
+uvicorn app.app:app --host 127.0.0.1 --port 8000
+```
+
+4. Cleanup:
+```bash
+docker rm -f trp-redis
+```
+
+### 4.4 Run Showcase24 comparison
 
 ```bash
-python TRP/tests/compare_qwen_tool_use.py \
+python tests/compare_qwen_tool_use.py \
   --task-profile showcase24 \
   --mode both \
   --router-url http://127.0.0.1:8000 \
-  --out results/showcase24_full.json
+  --out tests/results/showcase24_full.json
 ```
 
-## 4.4 跑 Tau2（airline + retail）
+### 4.5 Run Tau2 (airline + retail)
+
+Default local layout expected by the script:
+- Tau2 source: `TRP/data/tau2-bench`
+- Env file: `TRP/.env`
 
 ```bash
-python TRP/tests/compare_tau2_benchmark.py \
+python tests/compare_tau2_benchmark.py \
   --domains airline retail \
   --split base \
   --num-trials 4 \
@@ -195,19 +241,20 @@ python TRP/tests/compare_tau2_benchmark.py \
   --baseline-agent llm_agent
 ```
 
-输出汇总：
-- `results/tau2/summary_compare_tau2_trp_vs_traditional.json`
+If your Tau2 folder is elsewhere, pass `--tau2-root` explicitly.
 
-## 5. 复现公平性说明
+Output summary:
+- `tests/results/tau2/summary_compare_tau2_trp_vs_traditional.json`
 
-在 Tau2 对比中，以下配置应保持一致：
-- 同一 task list（domain/split）
-- 同一 `num_trials`/`seed`
-- 同一 user simulator
-- 同一模型与 temperature
-- 同一最大步数与错误阈值
+## 5. Fairness Notes for Comparison
 
-唯一变量应是 agent 形态：
-- traditional：LLM 直接多工具调用
-- TRP：LLM 通过单 router tool 调用
+For Tau2 comparisons, keep these fixed:
+- Same task list (`domain/split`)
+- Same `num_trials` and `seed`
+- Same user simulator
+- Same model and temperature
+- Same max steps and max errors
 
+The only variable should be the agent interface:
+- traditional: LLM directly calls multiple tools
+- TRP: LLM calls a single router tool
