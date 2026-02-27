@@ -1,4 +1,4 @@
-# TRP (Tool Routing Protocol) v2.0
+# TRP (Tool Routing Protocol) v3.0
 
 TRP routes all tool use through a single stable interface (`router`). The router handles capability orchestration, policy checks, idempotency, and batch execution so the model does not need to manage a large and unstable tool surface directly.
 
