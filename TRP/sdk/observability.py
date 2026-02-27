@@ -17,8 +17,8 @@ def _labels(**kwargs: Any) -> LabelTuple:
 
 class TRPMetrics:
     """
-    轻量线程安全 metrics collector（Prometheus text exposition）。
-    先覆盖关键计数与延迟总量，避免引入额外依赖。
+    Lightweight thread-safe metrics collector (Prometheus text exposition).
+    Focuses on critical counters and latency totals without extra dependencies.
     """
 
     def __init__(self, *, backend: str):
@@ -76,7 +76,7 @@ class TRPMetrics:
 
             counters = dict(self._counters)
 
-        # HELP/TYPE（关键指标）
+        # HELP/TYPE (key metrics)
         lines.extend(
             [
                 "# HELP trp_router_info Static router info labels",
@@ -147,7 +147,7 @@ class MetricsAuditLogger:
 
 class JsonStdoutAuditLogger:
     """
-    结构化 stdout 日志（单行 JSON），便于本机和容器环境直接采集。
+    Structured stdout logging (single-line JSON) for easy local/container collection.
     """
 
     def __init__(self, *, enabled: bool = True):
@@ -184,5 +184,5 @@ class CompositeAuditLogger:
             try:
                 logger.log_event(event_name, payload)
             except Exception:
-                # 审计失败不影响主流程
+                # Audit failures must not break the main flow.
                 continue

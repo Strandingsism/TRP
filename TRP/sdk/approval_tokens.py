@@ -18,7 +18,7 @@ class ApprovalTokenError(Exception):
 
 def canonical_args_digest(args: Dict[str, Any]) -> str:
     """
-    对 canonical args 做稳定摘要，用于审批令牌绑定。
+    Build a stable digest for canonical args, used to bind approval tokens.
     """
     if not isinstance(args, dict):
         raise ApprovalTokenError("args must be a dict")

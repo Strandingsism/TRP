@@ -22,7 +22,7 @@ def main() -> int:
         raise SystemExit("use only one of --args-json or --args-file")
 
     if ns.args_file:
-        # PowerShell 5 `Set-Content -Encoding utf8` 会写入 BOM；utf-8-sig 可兼容读取
+        # PowerShell 5 `Set-Content -Encoding utf8` may write BOM; utf-8-sig keeps reads compatible.
         with open(ns.args_file, "r", encoding="utf-8-sig") as f:
             args = json.load(f)
     else:

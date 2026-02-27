@@ -17,7 +17,8 @@ from typing import Any, Iterable, Optional
 SCRIPT_PATH = Path(__file__).resolve()
 TRP_ROOT = SCRIPT_PATH.parents[1]
 REPO_ROOT = TRP_ROOT.parent
-DEFAULT_TAU2_ROOT = REPO_ROOT / "_vendor" / "tau2-bench"
+DEFAULT_TAU2_ROOT = TRP_ROOT / "data" / "tau2-bench"
+DEFAULT_ENV_FILE = TRP_ROOT / ".env"
 DEFAULT_RESULTS_DIR = TRP_ROOT / "tests" / "results" / "tau2"
 
 
@@ -32,14 +33,6 @@ def load_simple_env(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         env[key.strip()] = value.strip().strip('"').strip("'")
     return env
-
-
-def mask_secret(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return value
-    if len(value) <= 8:
-        return "*" * len(value)
-    return value[:4] + "*" * (len(value) - 8) + value[-4:]
 
 
 def percentile(values: list[float], pct: float) -> Optional[float]:
@@ -341,7 +334,7 @@ def _estimate_from_tau2_official_samples(
         "domain_sample_details": domain_samples,
         "note": (
             "Estimate extrapolated from Tau2 official airline/retail published trajectories. "
-            "Actual deepseek-reasoner completion tokens may differ."
+            "Actual completion tokens may differ by model/provider."
         ),
     }
 
@@ -353,9 +346,30 @@ def _make_litellm_model_and_args_from_env(
     api_key: Optional[str],
     temperature: float,
 ) -> tuple[str, dict[str, Any]]:
-    model_id = (model_id or env.get("DEEPSEEK_MODEL_ID") or "deepseek-reasoner").strip()
-    base_url = (base_url or env.get("DEEPSEEK_BASE_URL") or "").strip() or None
-    api_key = (api_key or env.get("DEEPSEEK_API_KEY") or "").strip() or None
+    model_id = (
+        model_id
+        or env.get("TAU2_MODEL_ID")
+        or env.get("TRP_MODEL_ID")
+        or env.get("MODEL_ID")
+        or ""
+    ).strip()
+    if not model_id:
+        raise ValueError("Model is required. Set --agent-model/--user-model or TAU2_MODEL_ID/TRP_MODEL_ID.")
+
+    base_url = (
+        base_url
+        or env.get("TAU2_BASE_URL")
+        or env.get("TRP_BASE_URL")
+        or env.get("OPENAI_BASE_URL")
+        or ""
+    ).strip() or None
+    api_key = (
+        api_key
+        or env.get("TAU2_API_KEY")
+        or env.get("TRP_API_KEY")
+        or env.get("OPENAI_API_KEY")
+        or ""
+    ).strip() or None
 
     litellm_model = model_id
     if base_url and "/" not in model_id:
@@ -828,7 +842,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Run a fair Tau2 comparison: traditional LLM agent vs TRP-style router agent."
     )
     p.add_argument("--tau2-root", type=Path, default=DEFAULT_TAU2_ROOT)
-    p.add_argument("--env-file", type=Path, default=REPO_ROOT / ".env")
+    p.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     p.add_argument("--domains", nargs="+", default=["airline", "retail"], choices=["airline", "retail"])
     p.add_argument("--split", type=str, default="base")
     p.add_argument("--num-trials", type=int, default=4)
@@ -874,7 +888,7 @@ def main() -> None:
     )
     user_model, user_llm_args = _make_litellm_model_and_args_from_env(
         env=env,
-        model_id=(args.user_model or args.agent_model or env.get("DEEPSEEK_MODEL_ID")),
+        model_id=(args.user_model or args.agent_model or env.get("TAU2_MODEL_ID") or env.get("TRP_MODEL_ID")),
         base_url=args.base_url,
         api_key=args.api_key,
         temperature=args.temperature,
@@ -926,8 +940,6 @@ def main() -> None:
                         "num_trials": args.num_trials,
                         "agent_model": agent_model,
                         "user_model": user_model,
-                        "base_url": agent_llm_args.get("api_base"),
-                        "api_key_masked": mask_secret(agent_llm_args.get("api_key")),
                     },
                     "estimate": estimate,
                 },
@@ -951,8 +963,6 @@ def main() -> None:
     print(f"Running Tau2 benchmark comparison -> {run_root}")
     print(f"Agent model: {agent_model}")
     print(f"User model:  {user_model}")
-    print(f"API base:    {agent_llm_args.get('api_base')}")
-    print(f"API key:     {mask_secret(agent_llm_args.get('api_key'))}")
     if "deepseek-reasoner" in agent_model:
         print("Reasoner compat patch: ENABLED (preserve assistant reasoning_content in history)")
         print("Empty assistant retry patch: ENABLED (retry provider empty replies)")
@@ -1046,8 +1056,8 @@ def main() -> None:
             "user_impl": args.user_impl,
             "agent_model": agent_model,
             "user_model": user_model,
-            "llm_args_agent": {**agent_llm_args, "api_key": mask_secret(agent_llm_args.get("api_key"))},
-            "llm_args_user": {**user_llm_args, "api_key": mask_secret(user_llm_args.get("api_key"))},
+            "llm_args_agent": {"temperature": agent_llm_args.get("temperature")},
+            "llm_args_user": {"temperature": user_llm_args.get("temperature")},
             "pricing": {
                 "input_rmb_per_mtoken": pricing.input_rmb_per_mtoken,
                 "output_rmb_per_mtoken": pricing.output_rmb_per_mtoken,

@@ -82,7 +82,7 @@ def _schema_nack(raw_frame: Any, message: str, error_code: str = "TRP_2000") -> 
         },
     }
 
-# 组装（Composition Root / 依赖注入）
+# Composition root / dependency wiring
 registry = InMemoryCapabilityRegistry()
 state_backend = str(os.getenv("TRP_STATE_BACKEND", "memory")).strip().lower()
 redis_url = os.getenv("TRP_REDIS_URL", "redis://127.0.0.1:6379/0")
@@ -96,7 +96,7 @@ audit = CompositeAuditLogger(
 
 if state_backend == "redis":
     redis_client = RedisRESPClient(redis_url, timeout_sec=float(os.getenv("TRP_REDIS_TIMEOUT_SEC", "2")))
-    # 启动时 fail-fast，避免误以为已启用持久化
+    # Fail fast at startup to avoid assuming persistence is enabled when Redis is unreachable.
     redis_client.ping()
     sessions = RedisSessionManager(
         redis=redis_client,
@@ -155,7 +155,7 @@ async def trp_frame(request: Request) -> Dict[str, Any]:
             frame = validate_trp_frame(raw_frame)
         else:
             frame = raw_frame
-        # 可选：从 header / session 注入 auth_context
+        # Optional: inject auth_context from header/session.
         # frame["auth_context"] = {"role": "ops", "can_delete": True}
         res = router_service.handle_frame(frame)
         response_frame_type = str(res.get("frame_type", "UNKNOWN"))
@@ -171,7 +171,7 @@ async def trp_frame(request: Request) -> Dict[str, Any]:
         err_code = "TRP_2000"
         return res
     except ValueError as e:
-        # 包含 request.json() 的 JSON decode 错误
+        # Includes request.json() JSON decode errors.
         if raw_frame is None:
             res = _schema_nack(None, f"invalid JSON body: {e}")
             response_frame_type = "NACK"
@@ -228,7 +228,7 @@ async def readyz() -> JSONResponse:
 
 @app.get("/metrics")
 async def metrics_endpoint() -> PlainTextResponse:
-    # 每次导出前刷新 readiness gauge（尤其 Redis 模式）
+    # Refresh readiness gauge before export (especially in Redis mode).
     if state_backend == "redis":
         try:
             metrics.set_readiness(ready=bool(redis_client and redis_client.ping()))

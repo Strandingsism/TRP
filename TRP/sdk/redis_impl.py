@@ -59,8 +59,8 @@ def parse_redis_url(url: str) -> RedisURL:
 
 class RedisRESPClient:
     """
-    极简 RESP2 客户端（标准库实现），避免引入 redis-py 依赖。
-    目标：跨 Windows/Linux 可运行，用于当前原型的持久化验证。
+    Minimal RESP2 client implemented with the standard library only.
+    Goal: run on both Windows/Linux for persistence validation in this prototype.
     """
 
     def __init__(self, url: str, *, timeout_sec: float = 2.0):
@@ -235,7 +235,7 @@ return {'OK', tostring(expected + 1)}
             "retry_budget", str(self._default_retry_budget),
             "created_at", now_ts,
         )
-        # 创建空 set（用占位 member 后立刻删除），确保能设置 TTL
+        # Create an empty set (add/remove a placeholder member) so TTL can be set.
         self._redis.execute("SADD", seen_key, "__bootstrap__")
         self._redis.execute("SREM", seen_key, "__bootstrap__")
         self._redis.execute("PEXPIRE", meta_key, self._session_ttl_ms)
@@ -337,13 +337,14 @@ class RedisIdempotencyStore(IdempotencyStore):
 
 class RedisRuntimeStateStore(RuntimeStateStore):
     """
-    RouterService 运行时状态持久化（单条 JSON 文档）
-    - call_records: depends_on 所需的调用结果状态
-    - async_state: 结果查询/partial 事件状态
+    RouterService runtime state persistence (single JSON document).
+    - call_records: dependency call result states used by depends_on
+    - async_state: result-query / partial-event state
 
-    说明：
-    - 基础读写仍为 JSON GET/SET。
-    - async_state 的关键并发路径（merge/append/claim/renew）已使用 Lua 原子脚本。
+    Notes:
+    - Base read/write still uses JSON GET/SET.
+    - Critical async_state concurrency paths (merge/append/claim/renew)
+      are implemented with atomic Lua scripts.
     """
 
     def __init__(self, *, redis: RedisRESPClient, key_prefix: str = "trp"):

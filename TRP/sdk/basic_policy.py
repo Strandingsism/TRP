@@ -12,10 +12,10 @@ from .approval_tokens import validate_approval_token
 
 class BasicPolicyEngine(PolicyEngine):
     """
-    基础策略（适合 MVP）：
-    1) LOW / MEDIUM 默认放行
-    2) HIGH / CRITICAL 默认要求 approval_token
-    3) 可通过 auth_context 做简单权限控制
+    Baseline policy (MVP-friendly):
+    1) LOW / MEDIUM are allowed by default
+    2) HIGH / CRITICAL require approval_token by default
+    3) auth_context can enforce simple permission checks
     """
 
     def __init__(
@@ -44,9 +44,9 @@ class BasicPolicyEngine(PolicyEngine):
     ) -> PolicyDecision:
         auth_context = auth_context or {}
 
-        # ---- 可选：按角色限制能力 ----
-        # auth_context 示例：
-        # {"role": "analyst"} 或 {"role": "ops", "can_delete": True}
+        # ---- Optional: restrict capabilities by role ----
+        # auth_context examples:
+        # {"role": "analyst"} or {"role": "ops", "can_delete": True}
         role = auth_context.get("role")
         if role == "readonly" and cap.io_class == "WRITE":
             return PolicyDecision(
@@ -55,9 +55,9 @@ class BasicPolicyEngine(PolicyEngine):
                 reason="readonly role cannot invoke WRITE capabilities",
             )
 
-        # ---- MEDIUM: 可加额外限制（示例）----
+        # ---- MEDIUM: optional extra restrictions (example) ----
         if cap.risk_tier == "MEDIUM":
-            # 例：限制 sql 查询规模（这里仅示意）
+            # Example: enforce SQL query size limit (illustrative only).
             if cap.cap_id == "cap.query.sql_read.v1":
                 limit = args.get("limit", 50)
                 if isinstance(limit, int) and limit > 200:
@@ -68,11 +68,11 @@ class BasicPolicyEngine(PolicyEngine):
                     )
             return PolicyDecision(allowed=True)
 
-        # ---- LOW: 放行 ----
+        # ---- LOW: allow ----
         if cap.risk_tier == "LOW":
             return PolicyDecision(allowed=True)
 
-        # ---- HIGH: 要审批 ----
+        # ---- HIGH: requires approval ----
         if cap.risk_tier == "HIGH":
             if not approval_token:
                 return PolicyDecision(
@@ -93,7 +93,7 @@ class BasicPolicyEngine(PolicyEngine):
                 )
             return PolicyDecision(allowed=True)
 
-        # ---- CRITICAL: 更严格 ----
+        # ---- CRITICAL: stricter gate ----
         if cap.risk_tier == "CRITICAL":
             if not self.allow_critical_with_token:
                 return PolicyDecision(
@@ -119,7 +119,7 @@ class BasicPolicyEngine(PolicyEngine):
                     reason=reason,
                 )
 
-            # 二次权限开关（比如只有 ops 才能删）
+            # Secondary permission switch (e.g. only ops can delete).
             if not auth_context.get("can_delete", False):
                 return PolicyDecision(
                     allowed=False,
@@ -128,7 +128,7 @@ class BasicPolicyEngine(PolicyEngine):
                 )
             return PolicyDecision(allowed=True)
 
-        # 未知风险等级：保守拒绝
+        # Unknown risk tier: deny conservatively.
         return PolicyDecision(
             allowed=False,
             requires_approval=False,
@@ -159,7 +159,7 @@ class BasicPolicyEngine(PolicyEngine):
                 return True, "ok"
             return False, "invalid approval_token format"
 
-        # 未配置签名校验：兼容旧前缀规则
+        # Signature validation is not configured: keep compatibility with legacy prefix rule.
         if token.startswith("appr_"):
             return True, "ok"
         return False, "invalid approval_token format"

@@ -19,13 +19,9 @@ def _find_trp_root(start: Path) -> Path:
 
 
 TRP_ROOT = _find_trp_root(Path(__file__).resolve())
-REPO_ROOT = TRP_ROOT.parent
-LEARN_AGENTS_DIR = REPO_ROOT / "learn_claude_code" / "agents"
 
 if str(TRP_ROOT) not in sys.path:
     sys.path.insert(0, str(TRP_ROOT))
-if str(LEARN_AGENTS_DIR) not in sys.path:
-    sys.path.insert(0, str(LEARN_AGENTS_DIR))
 
 
 # ---- result models ----
@@ -468,7 +464,7 @@ def _validate_text(task: TaskCase, text: str) -> List[str]:
 
 
 def _load_qwen_client():
-    # lazy import，避免 --help 时就要求 API key
+    # Lazy import so `--help` does not require API key setup.
     import llm_client  # type: ignore
 
     _ensure_llm_client_usage_patch(llm_client)
@@ -577,7 +573,9 @@ class QwenToolLoop:
         self.system_prompt = system_prompt
         self.tools = tools
         self.handlers = handlers
-        self.model = model or os.getenv("MODEL_ID", "qwen-plus")
+        self.model = model or os.getenv("TRP_MODEL_ID") or os.getenv("MODEL_ID") or ""
+        if not self.model:
+            raise ValueError("Set TRP_MODEL_ID (or MODEL_ID), or pass model explicitly.")
 
     def run(self, user_prompt: str, *, max_steps: int = 12) -> RunRecord:
         messages: List[Dict[str, Any]] = [{"role": "user", "content": user_prompt}]
@@ -764,7 +762,7 @@ class TRPRouterRunner:
             self._HttpTRPTransport(self.router_url),
             agent_id=f"cmp_shared_{uuid.uuid4().hex[:6]}",
         )
-        # 生产/真实使用更接近复用 session+catalog，而不是每个任务都 cold-start。
+        # Production usage is closer to reusing session+catalog than cold-starting each task.
         self._client.hello()
         self._client.sync_catalog()
 
@@ -922,7 +920,7 @@ def _summary_table_by_group(records: List[RunRecord], tasks: List[TaskCase]) -> 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Compare TRP single-router-tool vs s02-style direct multi-tool with Qwen"
+        description="Compare TRP single-router-tool vs s02-style direct multi-tool"
     )
     ap.add_argument("--mode", choices=["trp", "traditional", "both"], default="both")
     ap.add_argument("--router-url", default="http://127.0.0.1:8000", help="TRP router base URL")
@@ -983,7 +981,7 @@ def main() -> None:
         "meta": {
             "mode": args.mode,
             "router_url": args.router_url,
-            "model_id": os.getenv("MODEL_ID", "qwen-plus"),
+            "model_id": os.getenv("TRP_MODEL_ID") or os.getenv("MODEL_ID") or "",
             "task_profile": args.task_profile,
             "task_profile_note": TASK_PROFILE_NOTES.get(args.task_profile, ""),
             "elapsed_ms": round(elapsed_ms, 2),

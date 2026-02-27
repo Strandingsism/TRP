@@ -1,0 +1,11 @@
+fastapi>=0.115.0
+uvicorn>=0.30.0
+pydantic>=2.7.0
+requests>=2.31.0
+python-dotenv>=1.0.1
+openai>=1.40.0
+
+# Benchmark/runtime utilities
+litellm>=1.74.0
+tenacity>=8.2.3
+loguru>=0.7.2

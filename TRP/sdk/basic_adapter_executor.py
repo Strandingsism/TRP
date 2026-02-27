@@ -15,7 +15,7 @@ from .router_interfaces import (
 
 
 # =========================
-# Adapters（参数校验 + canonical -> native）
+# Adapters (argument validation + canonical -> native)
 # =========================
 
 class SearchAdapter(Adapter):
@@ -124,14 +124,14 @@ class BasicAdapterRegistry(AdapterRegistry):
 
 
 # =========================
-# Demo Executor（假执行器/内存执行器）
+# Demo Executor (mock/in-memory executor)
 # =========================
 
 class BasicExecutor(Executor):
     """
-    一个最小可运行执行器：
-    - 搜索/查询返回 mock 数据
-    - ticket_create / record_delete 维护内存状态，便于测试幂等和审批
+    Minimal executable executor:
+    - search/query returns mock data
+    - ticket_create / record_delete keep in-memory state for idempotency and approval testing
     """
     def __init__(self, *, base_sleep_sec: float = 0.01):
         self._tickets: Dict[str, Dict[str, Any]] = {}
@@ -139,7 +139,7 @@ class BasicExecutor(Executor):
         self._base_sleep_sec = max(0.0, float(base_sleep_sec))
 
     def execute(self, cap: CapabilityMeta, native_args: Dict[str, Any], timeout_ms: int) -> Dict[str, Any]:
-        # 这里可模拟耗时
+        # Simulate execution latency here.
         if timeout_ms < 5:
             raise TimeoutError("timeout too small")
         if self._base_sleep_sec > 0:
@@ -169,7 +169,7 @@ class BasicExecutor(Executor):
 
         if cap.cap_id == "cap.query.sql_read.v1":
             sql = native_args["sql"]
-            # 简单 mock：返回伪行数据
+            # Simple mock: return pseudo rows.
             rows = [
                 {"id": 1, "name": "alpha", "value": 42},
                 {"id": 2, "name": "beta", "value": 17},
@@ -202,7 +202,7 @@ class BasicExecutor(Executor):
 
 
 # =========================
-# Result Shaper（高信号返回）
+# Result Shaper (high-signal output format)
 # =========================
 
 class BasicResultShaper(ResultShaper):
@@ -263,7 +263,7 @@ class BasicResultShaper(ResultShaper):
                 "artifacts": [],
             }
 
-        # 默认
+        # Default
         return {
             "summary": "Operation completed",
             "data": raw,

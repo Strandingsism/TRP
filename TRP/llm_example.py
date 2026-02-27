@@ -4,15 +4,15 @@ from sdk.trp_types import CallSpec
 
 router = RouterClient(HttpTRPTransport("http://localhost:8000"))
 
-# 1) 初始化
+# 1) Initialize
 router.hello()
 catalog = router.sync_catalog()
 
-# 2) 看目录（LLM 可以看到 idx + cap_id + desc）
+# 2) Inspect the catalog (LLM can see idx + cap_id + desc)
 for c in catalog:
     print(c.idx, c.cap_id, c.name, "-", c.desc)
 
-# 3) 单次调用（按 idx + cap_id）
+# 3) Single call (by idx + cap_id)
 res = router.call(
     idx=0,
     cap_id="cap.search.web.v1",
@@ -21,7 +21,7 @@ res = router.call(
 )
 print(res["result"]["summary"])
 
-# 4) 批量调用（你的 index 方案优势会很明显）
+# 4) Batch call (the index-based approach shows clear benefits here)
 calls = [
     CallSpec(
         call_id="call_a",

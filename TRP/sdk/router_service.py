@@ -82,7 +82,7 @@ class RouterService:
                 return self._result_query(frame)
             return self._nack(frame, None, "INTERNAL_ERROR", "TRP_5000", f"unsupported frame_type: {ftype}", False)
         except Exception as e:
-            # 兜底（理论上顺序类错误不会再走到这里）
+            # Fallback guard (ordering errors should normally be handled earlier).
             self.audit.log_event("router.internal_error", {"error": repr(e), "frame": self._safe_frame(frame)})
             return self._nack(frame, None, "INTERNAL_ERROR", "TRP_5001", "internal error", False)
 
@@ -146,7 +146,7 @@ class RouterService:
             status = existing.get("status")
             if status in {"QUEUED", "RUNNING"}:
                 if status == "QUEUED":
-                    # 允许重复 ASYNC 调用触发 redrive；真正执行去重由 claim_async_execution 保证。
+                    # Allow duplicate ASYNC calls to trigger redrive; actual execution dedupe is guarded by claim_async_execution.
                     worker_frame = self._clone_frame_for_async(frame)
                     self._async_pool.submit(self._run_async_call, worker_frame)
                     self._append_async_event(
@@ -430,7 +430,7 @@ class RouterService:
             sub_frame = dict(frame)
             sub_frame["frame_id"] = f'{frame["frame_id"]}:{c["call_id"]}'
             sub_frame["payload"] = c
-            # batch 内部子调用不再推进 seq（seq 已由 batch 占用）
+            # Sub-calls inside a batch must not advance seq (batch frame already consumes seq).
             res = self._execute_call_core(sub_frame, check_seq=False)
             results_map[c["call_id"]] = self._batch_result_item(c["call_id"], res)
         return results_map
@@ -449,7 +449,7 @@ class RouterService:
 
         with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
             while pending or running:
-                # 先处理明显无法满足的依赖（依赖已失败）
+                # First handle dependencies that are already impossible (failed dependency).
                 for call_id in list(pending.keys()):
                     c = pending[call_id]
                     dep_failure = self._find_failed_dependency(
@@ -470,7 +470,7 @@ class RouterService:
                     self._record_call_result(session_id, call_id, success=False, retryable=False)
                     pending.pop(call_id, None)
 
-                # 提交 ready 任务（考虑依赖和并发上限）
+                # Submit ready tasks (respecting dependencies and concurrency limit).
                 slots = max_concurrency - len(running)
                 if slots > 0:
                     ready_ids = []
@@ -490,7 +490,7 @@ class RouterService:
                         running[fut] = call_id
 
                 if not running:
-                    # 无可执行任务但还有 pending：依赖缺失/循环依赖
+                    # No runnable tasks but pending remains: missing deps or cyclic deps.
                     for call_id in list(pending.keys()):
                         results_map[call_id] = {
                             "call_id": call_id,
@@ -557,7 +557,7 @@ class RouterService:
         approval_token = p.get("approval_token")
         auth_context = frame.get("auth_context")
 
-        # 0) 依赖检查（v0.1：要求依赖调用已完成且成功）
+        # 0) Dependency check (v0.1 requires dependencies to be completed and successful).
         if not isinstance(depends_on, list) or any(not isinstance(x, str) for x in depends_on):
             self._record_call_result(session_id, call_id, success=False, retryable=False)
             return self._nack(frame, call_id, "SCHEMA_MISMATCH", "TRP_2003", "depends_on must be a list of call_id strings", False)
@@ -573,7 +573,7 @@ class RouterService:
                 retry_hint=dep_check.get("retry_hint"),
             )
 
-        # 1) 目录解析与校验（idx + cap_id + epoch）
+        # 1) Catalog resolution and validation (idx + cap_id + epoch).
         try:
             cap = self.registry.resolve(
                 session_id=session_id,
@@ -592,7 +592,7 @@ class RouterService:
                 retry_hint={"action": "SYNC_CATALOG", "backoff_ms": 50},
             )
 
-        # 2) 高副作用幂等检查
+        # 2) Idempotency check for high-side-effect operations.
         if cap.io_class == "WRITE" and not idem_key:
             self._record_call_result(session_id, call_id, success=False, retryable=False)
             return self._nack(
@@ -616,7 +616,7 @@ class RouterService:
                     session_id=session_id,
                 )
 
-        # 3) 参数校验与语义映射
+        # 3) Argument validation and semantic mapping.
         adapter = self.adapters.get(cap.adapter_key)
         try:
             adapter.validate_canonical_args(cap, args)
@@ -625,7 +625,7 @@ class RouterService:
             self._record_call_result(session_id, call_id, success=False, retryable=False)
             return self._nack(frame, call_id, "SCHEMA_MISMATCH", "TRP_2001", str(e), False)
 
-        # 4) 策略判断（权限/审批）
+        # 4) Policy evaluation (permissions/approval).
         decision = self.policy.evaluate(
             auth_context=auth_context,
             cap=cap,
@@ -654,7 +654,7 @@ class RouterService:
                 False,
             )
 
-        # 5) 执行
+        # 5) Execute.
         t0 = time.time()
         try:
             raw = self.executor.execute(cap, native_args, timeout_ms=timeout_ms)
@@ -715,8 +715,8 @@ class RouterService:
 
     def _check_seq(self, frame: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        成功返回 None；失败返回 NACK frame。
-        不把顺序类异常抛到 handle_frame 顶层。
+        Return None on success; return a NACK frame on failure.
+        Keep ordering exceptions from bubbling to top-level handle_frame.
         """
         try:
             r = self.sessions.check_and_advance_seq(
@@ -751,7 +751,7 @@ class RouterService:
                 )
 
             if ename == "DuplicateFrameError":
-                # MVP 先返回 NACK；后面可升级成 ACK DUPLICATE
+                # MVP behavior: return NACK first; can be upgraded to ACK DUPLICATE later.
                 return self._nack(
                     frame,
                     None,
@@ -1272,7 +1272,7 @@ class RouterService:
         if not isinstance(data, dict):
             return
 
-        # 常见大字段分段：搜索 items / SQL rows
+        # Chunk common large array fields: search items / SQL rows.
         for path_key in ("items", "rows"):
             items = data.get(path_key)
             if not isinstance(items, list):
@@ -1293,7 +1293,8 @@ class RouterService:
                 )
             return
 
-        # 非列表结果也给一个轻量 data 摘要事件，避免只有最终 RESULT_QUERY 可见
+        # For non-list results, still emit a lightweight data preview event,
+        # so visibility is not limited to final RESULT_QUERY only.
         preview_keys = [k for k in list(data.keys())[:5]]
         if preview_keys:
             self._append_async_event(
@@ -1408,7 +1409,7 @@ class RouterService:
             elif base == "bool":
                 schema = {"type": "boolean"}
             else:
-                # MVP：未知模板类型保守降级为字符串
+                # MVP fallback: conservatively downgrade unknown template types to string.
                 schema = {"type": "string", "x-trp-template": base}
 
             properties[name] = schema

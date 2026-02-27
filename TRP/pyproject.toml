@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trp-router"
+version = "2.0.0"
+description = "TRP (Tool Routing Protocol) router and benchmark tooling"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn>=0.30.0",
+  "pydantic>=2.7.0",
+  "requests>=2.31.0",
+  "python-dotenv>=1.0.1",
+  "openai>=1.40.0",
+  "litellm>=1.74.0",
+  "tenacity>=8.2.3",
+  "loguru>=0.7.2",
+]
+

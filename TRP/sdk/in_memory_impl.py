@@ -18,7 +18,7 @@ from .router_interfaces import (
 
 
 # =========================
-# 自定义异常（给 RouterService 做细粒度映射）
+# Custom exceptions (for fine-grained RouterService mapping)
 # =========================
 
 class OrderViolationError(Exception):
@@ -39,7 +39,7 @@ class CatalogMismatchError(Exception):
 
 
 # =========================
-# 默认能力目录（静态）
+# Default capability catalog (static)
 # =========================
 
 def _digest(arg_template: Dict[str, str]) -> str:
@@ -109,8 +109,8 @@ def build_default_capabilities() -> List[CapabilityMeta]:
 
 class InMemoryCapabilityRegistry(CapabilityRegistry):
     """
-    - 维护 catalog_epoch
-    - 为每个 session 提供稳定 idx->cap_id 映射（当前实现全局一致）
+    - Maintain catalog_epoch
+    - Provide stable idx->cap_id mapping per session (globally consistent in current implementation)
     """
     def __init__(self, capabilities: Optional[List[CapabilityMeta]] = None):
         self._lock = threading.Lock()
@@ -169,9 +169,9 @@ class InMemoryCapabilityRegistry(CapabilityRegistry):
 
 class InMemorySessionManager(SessionManager):
     """
-    维护：
+    Maintains:
     - expected_seq
-    - seen_frame_ids（防重复）
+    - seen_frame_ids (replay/duplicate protection)
     """
     def __init__(self, catalog_epoch_provider: Callable[[], int], default_retry_budget: int = 3):
         self._lock = threading.Lock()
@@ -214,7 +214,7 @@ class InMemorySessionManager(SessionManager):
             s = self._sessions[session_id]
             seen: set = s["seen_frame_ids"]
 
-            # frame_id 去重（重放保护）
+            # frame_id dedupe (replay protection)
             if frame_id in seen:
                 raise DuplicateFrameError(frame_id)
 
@@ -222,7 +222,7 @@ class InMemorySessionManager(SessionManager):
             if seq != expected:
                 raise OrderViolationError(expected_seq=expected, got_seq=seq)
 
-            # 接受
+            # Accept
             seen.add(frame_id)
             s["expected_seq"] = expected + 1
             return {"ok": True, "expected_seq_next": s["expected_seq"]}
@@ -260,12 +260,12 @@ class InMemoryIdempotencyStore(IdempotencyStore):
 
 
 # =========================
-# 简单审计日志（stdout）
+# Simple audit logger (stdout)
 # =========================
 
 class PrintAuditLogger(AuditLogger):
     def log_event(self, event_name: str, payload: Dict[str, Any]) -> None:
-        # 生产环境可换成 structlog / OpenTelemetry / Kafka
+        # In production, this can be replaced by structlog / OpenTelemetry / Kafka.
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         try:
             body = json.dumps(payload, ensure_ascii=False, default=str)

@@ -12,7 +12,7 @@ from .trp_types import (
 
 
 # =========================
-# 异常定义
+# Exception definitions
 # =========================
 
 class TRPError(Exception):
@@ -51,19 +51,19 @@ class RetryableTRPError(TRPError):
 
 
 # =========================
-# 传输层抽象（HTTP / MCP / IPC 都可以）
+# Transport abstraction (HTTP / MCP / IPC all supported)
 # =========================
 
 class TRPTransport(Protocol):
     def send_frame(self, frame: Dict[str, Any]) -> Dict[str, Any]:
         """
-        发送一个 TRP frame，返回 Router 的响应 frame（dict）。
+        Send one TRP frame and return the Router response frame (dict).
         """
         ...
 
 
 # =========================
-# 客户端状态
+# Client state
 # =========================
 
 @dataclass
@@ -77,19 +77,19 @@ class SessionState:
 
 
 # =========================
-# 主客户端
+# Main client
 # =========================
 
 class RouterClient:
     """
-    给 LLM/PTC 暴露的唯一对象（可把它绑定为 `router`）
+    The single object exposed to LLM/PTC (can be bound as `router`).
     """
     def __init__(self, transport: TRPTransport, agent_id: str = "agent_claude_ptc"):
         self.transport = transport
         self.agent_id = agent_id
         self.state = SessionState()
 
-    # ---------- 对外 API ----------
+    # ---------- Public API ----------
 
     def hello(self, resume_session_id: Optional[str] = None) -> Dict[str, Any]:
         frame = self._mk_frame(
@@ -112,7 +112,7 @@ class RouterClient:
         return payload
 
     def sync_catalog(self, mode: str = "FULL") -> List[CapabilityBrief]:
-        # sync_catalog 本身负责建立会话，不应再次要求 alias_table 已存在
+        # sync_catalog initializes session if needed; it should not require alias_table beforehand.
         if not self.state.session_id:
             self.hello()
         frame = self._mk_frame(
@@ -160,7 +160,7 @@ class RouterClient:
         execution_mode: str = "SYNC",
     ) -> Dict[str, Any]:
         """
-        单次调用（SDK 自动处理部分重试）
+        Single call (SDK automatically handles partial retries).
         """
         self._ensure_session()
         call_id = call_id or self._new_id("call")
@@ -191,7 +191,7 @@ class RouterClient:
                 if ftype == FrameType.RESULT:
                     return res["payload"]
                 if ftype == FrameType.ACK:
-                    # v0.1 默认同步执行，若未来改异步，这里可以轮询结果
+                    # v0.1 defaults to sync execution; if made async later, polling can be added here.
                     return res["payload"]
                 if ftype == FrameType.NACK:
                     self._raise_from_nack(res["payload"])
@@ -216,7 +216,7 @@ class RouterClient:
         approval_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        异步调用：立即返回 ACK（ACCEPTED/IN_PROGRESS/DUPLICATE）
+        Async call: returns ACK immediately (ACCEPTED/IN_PROGRESS/DUPLICATE).
         """
         return self.call(
             idx=idx,
@@ -238,7 +238,7 @@ class RouterClient:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
-        便捷接口：用 cap_id 调用，SDK 查 idx
+        Convenience API: call by cap_id, SDK resolves idx.
         """
         self._ensure_session()
         if cap_id not in self.state.cap_index:
@@ -254,7 +254,7 @@ class RouterClient:
         include_examples: bool = False,
     ) -> Dict[str, Any]:
         """
-        获取能力详细 schema / policy hints（按需拉取，避免 catalog 过大）
+        Fetch detailed capability schema/policy hints on demand to avoid oversized catalogs.
         """
         self._ensure_session()
         frame = self._mk_frame(
@@ -281,8 +281,8 @@ class RouterClient:
         include_partials: bool = True,
     ) -> Dict[str, Any]:
         """
-        查询异步调用结果（返回完整 frame）。
-        当传入 after_event_id 时，Router 可能返回 PARTIAL_RESULT。
+        Query async call result and return the full frame.
+        When after_event_id is provided, Router may return PARTIAL_RESULT.
         """
         self._ensure_session()
         payload: Dict[str, Any] = {"call_id": call_id}
@@ -309,10 +309,10 @@ class RouterClient:
         include_partials: bool = False,
     ) -> Dict[str, Any]:
         """
-        查询异步调用结果。
-        默认返回 RESULT_QUERY_RES.payload（兼容旧行为）。
-        若传入 after_event_id 且 Router 返回 PARTIAL_RESULT，则返回 PARTIAL_RESULT.payload，
-        并附带 `_frame_type` 字段。
+        Query async call result.
+        By default, return RESULT_QUERY_RES.payload (backward compatible behavior).
+        If after_event_id is provided and Router returns PARTIAL_RESULT, return
+        PARTIAL_RESULT.payload and include `_frame_type`.
         """
         res = self.query_result_frame(
             call_id=call_id,
@@ -332,8 +332,8 @@ class RouterClient:
         on_partial: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """
-        轮询等待异步调用结果，返回 query_result 的 payload。
-        若提供 on_partial，则会消费 PARTIAL_RESULT 事件并回调。
+        Poll until async call result is available and return query_result payload.
+        If on_partial is provided, consume PARTIAL_RESULT events and invoke callback.
         """
         deadline = time.time() + max(timeout_ms, 1) / 1000.0
         poll_sec = max(poll_interval_ms, 10) / 1000.0
@@ -351,14 +351,14 @@ class RouterClient:
                         try:
                             on_partial(ev)  # type: ignore[misc]
                         except Exception:
-                            # 回调异常不影响结果等待流程
+                            # Callback errors must not break the wait loop.
                             pass
                     nxt = p.get("next_after_event_id")
                     if isinstance(nxt, int) and nxt >= 0:
                         partial_cursor = nxt
 
                     if p.get("terminal") and p.get("final_available"):
-                        # 拉取最终结果（不请求 partial），避免重复收到同一批 partial
+                        # Fetch final result without partials to avoid receiving the same partial batch again.
                         res = self.query_result(call_id=call_id, include_partials=False)
                     else:
                         res = p
@@ -418,11 +418,11 @@ class RouterClient:
             self._raise_from_nack(res["payload"])
         raise TRPError(f"unexpected frame_type: {res['frame_type']}")
 
-    # ---------- 内部工具 ----------
+    # ---------- Internal helpers ----------
 
     def _send(self, frame: Dict[str, Any]) -> Dict[str, Any]:
         raw = self.transport.send_frame(frame)
-        # 最低限度校验
+        # Minimal response validation.
         if "frame_type" not in raw or "payload" not in raw:
             raise TRPError("invalid router response")
         return raw
@@ -465,7 +465,7 @@ class RouterClient:
         retry_hint = payload.get("retry_hint", {}) or {}
 
         if err_cls == ErrorClass.CATALOG_MISMATCH:
-            # 自动同步目录后抛出可重试
+            # Auto-sync catalog, then raise a retryable error.
             self.sync_catalog()
             raise RetryableTRPError(
                 msg, backoff_ms=retry_hint.get("backoff_ms", 50),
@@ -474,7 +474,7 @@ class RouterClient:
         if err_cls == ErrorClass.ORDER_VIOLATION:
             expected_seq = retry_hint.get("expected_seq")
             if expected_seq is not None:
-                # 把本地 seq 纠正到 expected_seq-1，下次 _next_seq() 正好对齐
+                # Align local seq to expected_seq-1 so next _next_seq() matches.
                 self.state.seq = max(0, int(expected_seq) - 1)
             raise RetryableTRPError(
                 msg, backoff_ms=retry_hint.get("backoff_ms", 50),

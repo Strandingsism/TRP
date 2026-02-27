@@ -12,7 +12,7 @@ class HttpTRPTransport(TRPTransport):
         self.timeout = timeout
 
     def send_frame(self, frame: Dict[str, Any]) -> Dict[str, Any]:
-        # 统一单端点，保持“LLM 只调用一个工具”的风格
+        # Keep a single endpoint to preserve the "LLM uses one tool" style.
         resp = requests.post(
             f"{self.base_url}/trp/frame",
             json=frame,

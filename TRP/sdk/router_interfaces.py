@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 
-# ========= 能力注册与目录 =========
+# ========= Capability Registry and Catalog =========
 
 @dataclass
 class CapabilityMeta:
@@ -15,44 +15,46 @@ class CapabilityMeta:
     io_class: str
     schema_digest: str
     arg_template: Dict[str, str]
-    adapter_key: str  # 指向哪个 adapter
+    adapter_key: str  # Which adapter handles this capability.
 
 
 class CapabilityRegistry(Protocol):
     def get_catalog(self, session_id: str) -> Tuple[int, List[Dict[str, Any]]]:
         """
-        返回 (catalog_epoch, alias_table)
-        alias_table 内每项至少包含 idx/cap_id/name/desc/risk/io/schema_digest
+        Return (catalog_epoch, alias_table).
+        Each alias_table item should at least include:
+        idx/cap_id/name/desc/risk/io/schema_digest.
         """
         ...
 
     def resolve(self, session_id: str, catalog_epoch: int, idx: int, cap_id: str) -> CapabilityMeta:
         """
-        校验 (catalog_epoch, idx, cap_id) 并返回 CapabilityMeta
-        若失配应抛 CatalogMismatch 异常
+        Validate (catalog_epoch, idx, cap_id) and return CapabilityMeta.
+        Should raise a CatalogMismatch-like exception on mismatch.
         """
         ...
 
 
-# ========= 会话与顺序 =========
+# ========= Session and Ordering =========
 
 class SessionManager(Protocol):
     def hello(self, agent_id: str, resume_session_id: Optional[str]) -> Dict[str, Any]:
         """
-        创建/恢复会话，返回 session_id、catalog_epoch、seq_start、retry_budget ...
+        Create/resume a session and return session_id, catalog_epoch,
+        seq_start, retry_budget, etc.
         """
         ...
 
     def check_and_advance_seq(self, session_id: str, seq: int, frame_id: str) -> Dict[str, Any]:
         """
-        校验顺序号。
-        返回 {"ok": True, "expected_seq_next": ...}
-        或抛 OrderViolation / Duplicate
+        Validate sequence order.
+        Return {"ok": True, "expected_seq_next": ...}
+        or raise OrderViolation / Duplicate.
         """
         ...
 
 
-# ========= 策略与审批 =========
+# ========= Policy and Approval =========
 
 @dataclass
 class PolicyDecision:
@@ -74,7 +76,7 @@ class PolicyEngine(Protocol):
         ...
 
 
-# ========= 幂等 =========
+# ========= Idempotency =========
 
 class IdempotencyStore(Protocol):
     def get(self, cap_id: str, idempotency_key: str) -> Optional[Dict[str, Any]]:
@@ -84,7 +86,7 @@ class IdempotencyStore(Protocol):
         ...
 
 
-# ========= Router 运行时状态（可选持久化） =========
+# ========= Router Runtime State (optional persistence) =========
 
 class RuntimeStateStore(Protocol):
     def get_call_record(self, session_id: str, call_id: str) -> Optional[Dict[str, Any]]:
@@ -101,8 +103,8 @@ class RuntimeStateStore(Protocol):
 
     def merge_async_call_state(self, session_id: str, call_id: str, patch: Dict[str, Any], ttl_sec: int) -> Dict[str, Any]:
         """
-        原子合并 async state patch，返回合并后的完整 state。
-        多实例场景下应避免 get-modify-set 丢更新。
+        Atomically merge async state patch and return the full merged state.
+        In multi-instance deployments, avoid get-modify-set lost updates.
         """
         ...
 
@@ -116,7 +118,8 @@ class RuntimeStateStore(Protocol):
         ttl_sec: int,
     ) -> Dict[str, Any]:
         """
-        原子追加 async event，并维护 event_id / trim / ttl，返回更新后的完整 state。
+        Atomically append async event and maintain event_id / trim / ttl.
+        Return the updated full state.
         """
         ...
 
@@ -130,8 +133,8 @@ class RuntimeStateStore(Protocol):
         state_ttl_sec: int,
     ) -> Dict[str, Any]:
         """
-        原子尝试获取 async 执行权（claim/lease）。
-        返回 {"claimed": bool, "reason": "...", "state": {...}|None}
+        Atomically attempt to claim async execution ownership (claim/lease).
+        Return {"claimed": bool, "reason": "...", "state": {...}|None}.
         """
         ...
 
@@ -145,18 +148,18 @@ class RuntimeStateStore(Protocol):
         state_ttl_sec: int,
     ) -> Dict[str, Any]:
         """
-        原子续租 async 执行权（仅当前 owner 可续租）。
-        返回 {"renewed": bool, "reason": "...", "state": {...}|None}
+        Atomically renew async execution lease (only current owner can renew).
+        Return {"renewed": bool, "reason": "...", "state": {...}|None}.
         """
         ...
 
 
-# ========= 参数语义映射 =========
+# ========= Argument Semantics Mapping =========
 
 class Adapter(Protocol):
     def validate_canonical_args(self, cap: CapabilityMeta, args: Dict[str, Any]) -> None:
         """
-        schema + 语义 + 安全校验（必要时）
+        Validate schema + semantics + safety checks (when needed).
         """
         ...
 
@@ -172,13 +175,13 @@ class AdapterRegistry(Protocol):
         ...
 
 
-# ========= 执行与结果整形 =========
+# ========= Execution and Result Shaping =========
 
 class Executor(Protocol):
     def execute(self, cap: CapabilityMeta, native_args: Dict[str, Any], timeout_ms: int) -> Dict[str, Any]:
         """
-        调用真实工具（HTTP/DB/CLI/MCP）
-        返回原始结果（dict）
+        Execute real tools (HTTP/DB/CLI/MCP).
+        Return raw result (dict).
         """
         ...
 
@@ -186,7 +189,7 @@ class Executor(Protocol):
 class ResultShaper(Protocol):
     def shape_success(self, cap: CapabilityMeta, raw: Dict[str, Any]) -> Dict[str, Any]:
         """
-        统一 result 格式：summary/data/warnings/artifacts
+        Normalize result format: summary/data/warnings/artifacts.
         """
         ...
 
@@ -194,7 +197,7 @@ class ResultShaper(Protocol):
         ...
 
 
-# ========= 审计 =========
+# ========= Audit =========
 
 class AuditLogger(Protocol):
     def log_event(self, event_name: str, payload: Dict[str, Any]) -> None:
